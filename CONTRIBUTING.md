@@ -7,7 +7,7 @@ Thank you for your interest in contributing to kache! This document covers the d
 ### Prerequisites
 
 - [mise](https://mise.jdx.dev/) (recommended)
-- Rust **1.93+**
+- Rust **1.95+**
 - `just`
 
 ### Clone and build

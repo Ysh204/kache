@@ -5,7 +5,7 @@ edition = "2024"
 description = "Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — just hardlinks locally and S3 for sharing."
 license = "Apache-2.0"
 repository = "https://github.com/kunobi-ninja/kache"
-rust-version = "1.93"
+rust-version = "1.95"
 
 [workspace]
 members = ["crates/kache-core", "crates/kache-service"]
@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
 clap = { version = "4", features = ["derive"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 ratatui = "0.30"
 crossterm = "0.29"
 filetime = "0.2"
@@ -42,7 +42,7 @@ tar = "0.4"
 futures = "0.3"
 libc = "0.2"
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 [dev-dependencies]
 assert_cmd = "2"

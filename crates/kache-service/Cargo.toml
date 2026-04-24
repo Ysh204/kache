@@ -5,7 +5,7 @@ edition = "2024"
 description = "Remote service shell for kache planner endpoints"
 license = "Apache-2.0"
 repository = "https://github.com/kunobi-ninja/kache"
-rust-version = "1.93"
+rust-version = "1.95"
 
 [dependencies]
 anyhow = "1"

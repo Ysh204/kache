@@ -1,4 +1,9 @@
+[settings]
+# Read rust version from rust-toolchain.toml (single source of truth
+# for both rustup and mise).
+idiomatic_version_file_enable_tools = ["rust"]
+
 [tools]
-rust = "1.93"
+rust = "latest"
 "github:casey/just" = "1.43.1"
 helm = "latest"
