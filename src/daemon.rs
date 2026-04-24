@@ -2927,17 +2927,31 @@ pub fn force_recover(config: &Config) -> Result<()> {
 pub fn restart(config: &Config) -> Result<bool> {
     let socket_path = config.socket_path();
 
-    // Tier 1: service manager
+    // Tier 1: service manager. Only trust it if the resulting daemon actually
+    // responds to a real request AND no lingering daemon processes remain.
+    // `launchctl kickstart -k` only controls the launchd-spawned process; a
+    // manually-spawned zombie can still hold the socket, making the "restart"
+    // a no-op that looks like success at the socket layer.
     match crate::service::kickstart() {
         Ok(true) => {
             eprintln!("restarting daemon via service manager...");
             if wait_for_socket_until(&socket_path, None, Duration::from_secs(10))? {
-                eprintln!("daemon restarted");
-                return Ok(true);
+                let responsive = send_stats_request(config, false, None, None).is_ok();
+                let pids = find_daemon_pids();
+                if responsive && pids.len() <= 1 {
+                    eprintln!("daemon restarted");
+                    return Ok(true);
+                }
+                tracing::warn!(
+                    responsive,
+                    daemon_pids = ?pids,
+                    "service kickstart reported success but daemon isn't healthy; attempting nuclear recovery"
+                );
+            } else {
+                tracing::warn!(
+                    "service kickstart completed but socket not ready; attempting nuclear recovery"
+                );
             }
-            tracing::warn!(
-                "service kickstart completed but socket not ready; attempting nuclear recovery"
-            );
         }
         Ok(false) => {
             // No service installed — fall through to manual path.

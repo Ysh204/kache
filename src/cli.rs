@@ -3470,6 +3470,8 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
             .is_some_and(|c| crate::daemon::send_stats_request(c, false, None, None).is_ok())
     };
 
+    let mut daemon_step_failed = false;
+
     if is_daemon_reachable(&config) {
         println!("  \x1b[32m✓\x1b[0m daemon is running");
     } else if service_action_taken {
@@ -3494,6 +3496,7 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
                 true => println!("    \x1b[32m✓\x1b[0m daemon restarted"),
                 false => {
                     println!("    \x1b[31m✗\x1b[0m daemon did not restart — see `kache doctor`");
+                    daemon_step_failed = true;
                 }
             }
         }
@@ -3502,7 +3505,10 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
         if !check && prompt_yes_no("Start daemon now?", true, yes)? {
             match crate::daemon::start_daemon_background()? {
                 true => println!("    \x1b[32m✓\x1b[0m daemon started"),
-                false => println!("    \x1b[31m✗\x1b[0m daemon did not start within timeout"),
+                false => {
+                    println!("    \x1b[31m✗\x1b[0m daemon did not start within timeout");
+                    daemon_step_failed = true;
+                }
             }
         }
     }
@@ -3510,9 +3516,16 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
     println!();
     if check {
         println!("  Dry run complete — re-run without --check to apply.");
+        println!();
+        Ok(())
+    } else if daemon_step_failed {
+        println!("  \x1b[31m✗\x1b[0m Setup incomplete — see messages above.");
+        println!("     Run \x1b[1mkache doctor\x1b[0m for diagnostics.");
+        println!();
+        anyhow::bail!("init did not complete: daemon not reachable");
     } else {
         println!("  Setup complete. Run \x1b[1mkache doctor\x1b[0m to verify.");
+        println!();
+        Ok(())
     }
-    println!();
-    Ok(())
 }
