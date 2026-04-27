@@ -37,6 +37,16 @@ kache doctor
 
 `kache init` is idempotent — re-run it any time to repair configuration. If you prefer to configure things by hand, just export `RUSTC_WRAPPER=kache` or add it to `~/.cargo/config.toml` under `[build]`.
 
+## Why local kache is fast
+
+kache is useful even before remote cache is configured:
+
+- Local hits are restored with hardlinks into `target/`, so artifact bytes are not copied.
+- The store is content-addressed by blake3 hash, so identical artifact blobs are stored once and linked many times.
+- Misses compile normally, then kache records the outputs for future builds.
+- The daemon is optional for local caching. If it is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
+- Incremental compilation is disabled while kache wraps rustc, because artifact caching replaces that path and avoids APFS-related corruption on macOS.
+
 ## Development
 
 ```sh
@@ -77,74 +87,22 @@ The repo uses `just` as its single task runner. `mise.toml` pins the local Rust 
 
 Durations use human-friendly format: `7d`, `24h`, `30m`.
 
-### Sync
+## Remote cache and configuration
 
-`kache sync` works directly against S3 (no daemon required). By default, it filters pulls to crates found in the current workspace's `Cargo.lock`:
+`kache sync` can pull from and push to S3-compatible storage directly, without the daemon. Pulls are filtered by the current workspace's `Cargo.lock` by default. See [Sync](docs/kache-docs/remote-cache/sync.mdx) for the full command behavior and S3 layout.
 
-```sh
-kache sync              # pull missing deps + push local artifacts
-kache sync --pull       # download only
-kache sync --push       # upload only
-kache sync --all        # pull all artifacts (ignore Cargo.lock filter)
-kache sync --dry-run    # preview what would transfer
-```
-
-S3 layout: `{prefix}/{crate_name}/{cache_key}.tar.zst` — organized by crate for efficient filtered listing.
-
-## Configuration
-
-Configure via the TUI editor (`kache config`), environment variables, or the config file directly.
-
-Config file priority: `KACHE_CONFIG` env var > nearest project-local `.kache.toml` (walks up from the current directory) > user config at `~/.config/kache/config.toml` (respects `XDG_CONFIG_HOME`).
-
-Environment variables take highest priority, then config file, then defaults.
-
-| Variable | Config key | Default | Description |
-|---|---|---|---|
-| `KACHE_CACHE_DIR` | `cache.local_store` | `~/Library/Caches/kache` (macOS), `~/.cache/kache` (Linux) | Local store directory |
-| `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GB` | Max store size |
-| `KACHE_CONFIG` | — | XDG config path | Explicit config file path |
-| `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket for remote cache |
-| `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | — | Custom S3 endpoint (required for Ceph/MinIO/R2) |
-| `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | AWS region |
-| `KACHE_S3_PREFIX` | `cache.remote.prefix` | `artifacts` | S3 key prefix for all artifacts |
-| `KACHE_S3_PROFILE` | `cache.remote.profile` | — | AWS profile name for credentials (e.g. `ceph`) |
-| `KACHE_S3_ACCESS_KEY` | — | — | Explicit S3 access key (overrides profile) |
-| `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key (overrides profile) |
-| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `false` | Cache bin/dylib/cdylib outputs |
-| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly |
-| `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1-22) |
-| `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `8` | Max concurrent S3 operations |
-| `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
-| `KACHE_DISABLED` | — | `0` | Disable caching entirely |
-| `KACHE_LOG` | — | `kache=warn` | Log level |
-
-### Credential resolution order
-
-1. `KACHE_S3_ACCESS_KEY` + `KACHE_S3_SECRET_KEY` (explicit override)
-2. AWS profile from config (`profile` field or `KACHE_S3_PROFILE`)
-3. AWS default chain (`AWS_ACCESS_KEY_ID`, `~/.aws/credentials [default]`, IAM roles)
-
-### Example config (Ceph)
-
-```toml
-[cache.remote]
-type = "s3"
-bucket = "build-cache"
-endpoint = "https://s3.example.com"
-profile = "ceph"
-```
+Configuration is available through `kache config`, environment variables, or config files. Environment variables win over config files, and project-local `.kache.toml` files are supported. See [Configuration](docs/kache-docs/getting-started/configuration.mdx) for the full reference.
 
 ## Architecture
 
 - **Wrapper**: `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, restores hits via hardlinks
 - **Daemon**: Background process handles async S3 uploads, remote checks, and prefetch. Auto-restarts when binary is updated
-- **Store**: SQLite index + content-addressed directories under `{cache_dir}/store/`
+- **Store**: SQLite index + content-addressed blobs under `{cache_dir}/store/`; cache hits hardlink those blobs into `target/`
 - **Cache keys**: Deterministic blake3 hash of rustc version, crate name, source, dependencies, and normalized flags — portable across machines
 
-Incremental compilation is automatically disabled when kache wraps rustc (`CARGO_INCREMENTAL=0`), since kache's artifact caching subsumes it and avoids APFS-related corruption on macOS.
-
 ## Remote service
+
+Warning: server-side kache is still work in progress. Treat the planner service and chart as experimental until the deployment model, auth integration, and HA behavior are hardened.
 
 An optional remote planner service lives in [`crates/kache-service`](crates/kache-service). It persists planner state in an embedded SurrealDB database, serves planner endpoints over HTTP, and safely returns `use_fallback` when the database has no matching candidates.
 
@@ -158,7 +116,15 @@ cargo run -p kache-service
 helm upgrade --install kache-service ./charts/kache-service
 ```
 
-The chart in [`charts/kache-service`](charts/kache-service) is intentionally small: one `Deployment`, one `Service`, optional `PersistentVolumeClaim`, security defaults, health probes, and optional bearer-token wiring through an existing `Secret`. It does not bundle ingress or cluster-level policy.
+The chart in [`charts/kache-service`](charts/kache-service) is intentionally small: one `Deployment`, one `Service`, optional `PersistentVolumeClaim`, security defaults, health probes, optional `kunobi-auth` bearer-token wiring through an existing `Secret`, and optional `kunobi-ha` Lease-based leader election. It does not bundle ingress or cluster-level policy.
+
+Bearer-token auth is enabled by pointing the chart at an existing secret. Clients must send the same token through `KACHE_PLANNER_TOKEN`.
+
+```yaml
+auth:
+  existingSecret: kache-planner-token
+  existingSecretKey: token
+```
 
 The service stores its embedded planner database at `/var/lib/kache/planner.db` by default. The chart supports either ephemeral storage for preview/dev environments or a PVC for persisted state:
 
@@ -173,3 +139,14 @@ planner:
 ```
 
 For bootstrap/migration only, the service can still import a legacy JSON planner snapshot on startup via `KACHE_PLANNER_SEED_STATE_FILE`.
+
+For highly available deployments, enable leader election and raise the replica count. Followers stay healthy but not ready until they acquire the Kubernetes Lease:
+
+```yaml
+replicaCount: 2
+ha:
+  enabled: true
+  leaseName: kache-service
+```
+
+When combining HA with PVC-backed planner state, use storage that can be mounted by all scheduled replicas, or keep `replicaCount: 1`.
