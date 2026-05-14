@@ -13,6 +13,7 @@ mod build_intent;
 mod cache_key;
 mod cli;
 mod compile;
+mod compiler;
 mod config;
 mod config_tui;
 mod daemon;
@@ -255,7 +256,7 @@ enum LogMode {
 }
 
 fn detect_log_mode(env_args: &[String]) -> LogMode {
-    if env_args.len() >= 2 && args::looks_like_rustc(&env_args[1]) {
+    if env_args.len() >= 2 && compiler::detect_compiler(&env_args[1..]).is_some() {
         return LogMode::Wrapper;
     }
 
@@ -494,19 +495,6 @@ fn parse_duration_hours(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_looks_like_rustc() {
-        assert!(args::looks_like_rustc("rustc"));
-        assert!(args::looks_like_rustc("/usr/bin/rustc"));
-        assert!(args::looks_like_rustc(
-            "/home/user/.rustup/toolchains/stable/bin/rustc"
-        ));
-        assert!(args::looks_like_rustc("clippy-driver"));
-        assert!(args::looks_like_rustc("/path/to/bin/clippy-driver"));
-        assert!(!args::looks_like_rustc("gcc"));
-        assert!(!args::looks_like_rustc("--crate-name"));
-    }
 
     #[test]
     fn test_parse_duration_hours() {
