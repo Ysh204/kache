@@ -21,6 +21,10 @@
 //! - Multi-source compiles, multi-arch fat binaries
 //! - Response files, coverage instrumentation, split DWARF,
 //!   precompiled headers, modules, output-to-stdout
+//! - Any flag outside the allow-list (`flag_is_cache_safe`) — an
+//!   unmodeled codegen flag, a cross-target, profiling, or simply a
+//!   flag kache has not classified. Refused so an unknown flag is
+//!   never silently cached.
 //!
 //! Future work (separate PRs):
 //! - Link-mode / whole-executable caching
@@ -312,6 +316,16 @@ impl CcArgs {
     /// - **Modules** (`-fmodules`, `-fcxx-modules`): module
     ///   compilation has its own dependency model; doesn't fit the
     ///   per-TU cache model.
+    /// - **Any flag outside the allow-list**: the cache key captures
+    ///   the preprocessor expansion plus the codegen flags kache
+    ///   explicitly models (optimization / debug / `-std` / PIC /
+    ///   arch). A flag whose object-file effect is *not* captured —
+    ///   an unmodeled codegen flag (`-Ofast`, `-ffast-math`,
+    ///   `-march=…`, `-ffunction-sections`), a cross-target
+    ///   (`-target`, `--target=`), profiling (`-pg`), or a flag kache
+    ///   has never seen — would miscache. `flag_is_cache_safe` is the
+    ///   allow-list; anything it does not recognize is refused, with
+    ///   the offending flags named in the reason.
     /// - **Output to stdout** (`-o -`): not a cacheable artifact.
     /// - **Preprocess / Assemble mode**: `-E` and `-S` produce
     ///   developer-facing output that's rarely worth caching and
@@ -374,6 +388,40 @@ impl CcArgs {
                 reasons.push(RefuseReason::Unsupported("cc: modules"));
                 break;
             }
+        }
+
+        // Allow-list gate — the structural safety net.
+        //
+        // kache's cc cache key captures the preprocessor expansion
+        // plus the codegen flags it *explicitly* models (optimization,
+        // debug level, `-std`, PIC, target arch). A flag OUTSIDE that
+        // captured set would change the object file WITHOUT changing
+        // the key — a silent miscache.
+        //
+        // So this is an allow-list, not a deny-list: `flag_is_cache_safe`
+        // names the categories kache can account for, and ANYTHING
+        // else — an unmodeled codegen flag (`-Ofast`, `-ffast-math`,
+        // `-march=native`, `-ffunction-sections`), a cross-target
+        // (`-target`, `--target=`), profiling (`-pg`), or a flag kache
+        // has simply never seen — forces a passthrough. The rejected
+        // flags are named in the reason, so it is visible which flags
+        // blocked caching (and therefore which to add support for).
+        let rejected: Vec<&str> = self
+            .rest
+            .iter()
+            .map(String::as_str)
+            .filter(|a| !flag_is_cache_safe(a))
+            .collect();
+        if !rejected.is_empty() {
+            // Leak a per-invocation summary so it can ride in
+            // `RefuseReason::Unsupported(&'static str)`. The wrapper
+            // process handles one compile then exits, so the leak is
+            // bounded and short-lived.
+            let detail: &'static str = Box::leak(
+                format!("cc: unsupported flag(s): {}", rejected.join(" ")).into_boxed_str(),
+            );
+            tracing::debug!("{detail} — passthrough");
+            reasons.push(RefuseReason::Unsupported(detail));
         }
 
         // Output to stdout — `-o -` is unambiguous; an `-o` followed
@@ -547,6 +595,85 @@ fn parse_define(s: &str) -> (String, Option<String>) {
         Some((name, value)) => (name.to_string(), Some(value.to_string())),
         None => (s.to_string(), None),
     }
+}
+
+/// Optimization flags kache models in the cc cache key — the exact
+/// set `CcArgs::parse` extracts into `optimization`. A variant outside
+/// this set (`-Ofast`) is NOT modeled, so it is not cache-safe.
+const MODELED_OPT_FLAGS: &[&str] = &["-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Oz", "-Og"];
+
+/// Debug flags kache models — the exact set `CcArgs::parse` extracts
+/// into `debug_level`. A variant outside this set (`-gdwarf-5`,
+/// `-ggdb`, `-gline-tables-only`) changes the object's debug info but
+/// is not modeled, so it is not cache-safe.
+const MODELED_DEBUG_FLAGS: &[&str] = &["-g", "-g0", "-g1", "-g2", "-g3"];
+
+/// Whether a cc argument is safe to cache past — i.e. its effect on
+/// the object file is either fully captured by kache's cache key, or
+/// it has no effect on the object at all.
+///
+/// This is the **allow-list**. An argument is safe only if it falls
+/// into one of the recognized categories below. ANYTHING else — an
+/// unmodeled codegen flag, a cross-target, a flag kache has simply
+/// never seen — is unsafe, and [`CcArgs::refuse_reasons`] forces a
+/// passthrough. Erring toward "unsafe" is deliberate: an over-refusal
+/// costs a cache miss; an under-refusal is a silent miscache.
+fn flag_is_cache_safe(arg: &str) -> bool {
+    // Non-flag positional — a source file, or the value of a
+    // separate-argument flag (`-I dir`, `-o file`). Sources are
+    // counted by the parser; flag values are harmless here.
+    if !arg.starts_with('-') {
+        return true;
+    }
+
+    // (1) Codegen flags kache models directly in the cache key.
+    if MODELED_OPT_FLAGS.contains(&arg)
+        || MODELED_DEBUG_FLAGS.contains(&arg)
+        || arg == "-fPIC"
+        || arg == "-fpic"
+        || arg.starts_with("-std=")
+        // Single `-arch` — the resolved target arch is hashed.
+        // Multi-`-arch` is refused separately in `refuse_reasons`.
+        || arg == "-arch"
+    {
+        return true;
+    }
+
+    // (2) Preprocessor-captured: the flag's entire compile-time effect
+    //     is the header content / macros the `cc -E -P` expansion
+    //     sees, and the cache key hashes that expansion verbatim.
+    if arg.starts_with("-D")          // -DNAME      / -D NAME
+        || arg.starts_with("-U")      // -UNAME      / -U NAME
+        || arg.starts_with("-I")      // -Idir       / -I dir
+        || arg.starts_with("--sysroot")
+        || matches!(
+            arg,
+            "-include" | "-imacros" | "-isystem" | "-iquote" | "-idirafter"
+                | "-isysroot" | "-nostdinc" | "-nostdinc++" | "-undef"
+        )
+    {
+        return true;
+    }
+
+    // (3) No effect on the object of a successful compile: warnings
+    //     (incl. `-Werror` — changes success/failure, not the bytes),
+    //     dependency-file generation (writes a `.d` sidecar), and
+    //     build mechanics. `-W?,` passthrough forms (`-Wl,`, `-Wp,`,
+    //     `-Wa,`) carry a comma and are NOT treated as warnings —
+    //     they fall through to "unsafe".
+    if (arg.starts_with("-W") && !arg.contains(','))
+        || arg == "-w"
+        || arg.starts_with("-pedantic")
+        || arg.starts_with("-fdiagnostics-")
+        || matches!(arg, "-fcolor-diagnostics" | "-fno-color-diagnostics")
+        || matches!(arg, "-MD" | "-MMD" | "-MF" | "-MT" | "-MQ" | "-MP" | "-MG")
+        || matches!(arg, "-c" | "-o" | "-pipe" | "-v" | "--verbose")
+    {
+        return true;
+    }
+
+    // Everything else is unsafe — see `refuse_reasons`.
+    false
 }
 
 #[derive(Default)]
@@ -1179,6 +1306,113 @@ mod tests {
         assert!(
             descs.iter().any(|d| d.contains("stdout")),
             "expected stdout-output refuse, got: {descs:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_flags_outside_the_allow_list() {
+        // Flags whose object-file effect kache does not capture in the
+        // cache key. Each would miscache → must passthrough. Spans
+        // every shape, not just `-f…` / `-m…`: unmodeled optimization
+        // / debug variants, cross-targets, profiling.
+        for flag in &[
+            // unmodeled -f… / -m… codegen flags
+            "-ffast-math",
+            "-fsanitize=address",
+            "-funroll-loops",
+            "-fno-rtti",
+            "-fno-pic",
+            "-fvisibility=hidden",
+            "-ffunction-sections",
+            "-march=native",
+            "-mtune=skylake",
+            "-mavx2",
+            "-mmacosx-version-min=14.0",
+            // unmodeled optimization / debug variants
+            "-Ofast",
+            "-gdwarf-5",
+            "-ggdb",
+            "-gline-tables-only",
+            // cross-compilation target (would serve a foreign object)
+            "-target",
+            "--target=aarch64-linux-gnu",
+            // profiling instrumentation
+            "-pg",
+            // language override — not modeled in the key
+            "-x",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains("unsupported flag")),
+                "expected allow-list refuse for {flag}, got: {descs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_list_does_not_refuse_cache_safe_flags() {
+        // Flags kache fully accounts for: modeled codegen (opt / debug
+        // / std / pic / arch), preprocessor-captured (defines /
+        // includes / sysroot), and no-object-effect (warnings /
+        // dep-info / mechanics). None should trip the allow-list.
+        for flag in &[
+            "-O2",
+            "-O0",
+            "-Og",
+            "-g",
+            "-g2",
+            "-std=c11",
+            "-fPIC",
+            "-fpic", // modeled codegen
+            "-DFOO=1",
+            "-Iinclude",
+            "-isystem",
+            "-include",
+            "-nostdinc",
+            "-undef", // preprocessor
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused",
+            "-w",
+            "-pedantic", // diagnostics
+            "-pipe",
+            "-MMD",
+            "-MF",
+            "-fdiagnostics-color", // mechanics / dep-info / diag
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} is cache-safe and must NOT trip the allow-list, got: {descs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuse_reason_names_the_rejected_flags() {
+        // The refusal must report *which* flags blocked caching — that
+        // visibility is what makes "add support over time" actionable.
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-ffast-math",
+            "--target=aarch64-linux-gnu",
+        ]);
+        let detail = descs
+            .iter()
+            .find(|d| d.contains("unsupported flag"))
+            .expect("expected an unsupported-flag refuse reason");
+        assert!(
+            detail.contains("-ffast-math"),
+            "reason should name the flag: {detail}"
+        );
+        assert!(
+            detail.contains("--target=aarch64-linux-gnu"),
+            "reason should name every rejected flag: {detail}"
         );
     }
 
