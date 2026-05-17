@@ -16,7 +16,13 @@ use std::path::Path;
 /// set. Output binaries now embed sentinel paths in DWARF / PDB
 /// instead of machine-local prefixes — bytes are byte-incompatible
 /// with v3 single-prefix outputs, so the bump invalidates v3 entries.
-const CACHE_KEY_VERSION: u32 = 4;
+///
+/// v5: `--emit` is now hashed. `cargo check` emits `metadata`
+/// (`.rmeta`); `cargo build` emits `link` (`.rlib`). Same crate with
+/// everything else the key hashed identical → same key, so a check's
+/// metadata-only entry could be served to a build needing the
+/// `.rlib`. The composition changed, so v4 entries are invalidated.
+const CACHE_KEY_VERSION: u32 = 5;
 
 /// Compute the blake3 cache key for a rustc invocation.
 ///
@@ -24,6 +30,7 @@ const CACHE_KEY_VERSION: u32 = 4;
 /// - rustc version (full verbose string)
 /// - target triple
 /// - crate name and type
+/// - emit kinds (metadata vs link — distinguishes check from build)
 /// - codegen options (opt-level, lto, codegen-units, panic, etc.)
 /// - feature flags (sorted)
 /// - source file hash
@@ -83,6 +90,24 @@ pub fn compute_cache_key(
         hasher.update(b"edition:");
         hasher.update(edition.as_bytes());
         hasher.update(b"\n");
+    }
+
+    // emit kinds (sorted for determinism)
+    //
+    // `cargo check` runs `rustc --emit=metadata` (produces `.rmeta`);
+    // `cargo build` runs `--emit=link` (produces `.rlib`). With every
+    // other hashed input identical the two invocations would collide,
+    // letting a check's metadata-only entry be served to a build that
+    // needs the `.rlib` — a miscache. Hashing `emit` keeps the two
+    // keyed apart by design rather than by cargo's incidental per-unit
+    // `-C metadata` differing between the two.
+    let mut emit: Vec<&String> = args.emit.iter().collect();
+    emit.sort();
+    for kind in &emit {
+        hasher.update(b"emit:");
+        hasher.update(kind.as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!("[key:{}] emit:{}", crate_name, kind);
     }
 
     // codegen options (sorted for determinism)
@@ -705,6 +730,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_deterministic() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -733,6 +759,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_source() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
 
@@ -761,6 +788,7 @@ mod tests {
 
     #[test]
     fn test_unreadable_dep_produces_stable_key() {
+        let _lock = key_test_lock();
         // Simulate unreadable deps (sysroot crates) from two different paths —
         // the cache key should be identical because we use a sentinel, not the path.
         let dir = tempfile::tempdir().unwrap();
@@ -874,6 +902,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_features() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -904,6 +933,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_instrument_coverage() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, b"pub fn hello() {}").unwrap();
@@ -939,6 +969,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_instrument_coverage_two_arg() {
+        let _lock = key_test_lock();
         // Same test but with -C instrument-coverage (two-arg form)
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
@@ -974,6 +1005,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_tarpaulin_cfg() {
+        let _lock = key_test_lock();
         // Tarpaulin also passes --cfg=tarpaulin; verify it affects the key
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("lib.rs");
@@ -1007,6 +1039,7 @@ mod tests {
 
     #[test]
     fn test_coverage_keys_consistent_across_remap_forms() {
+        let _lock = key_test_lock();
         // Both joined and two-arg forms of instrument-coverage should produce
         // the same cache key (both map to codegen opt "instrument-coverage")
         let dir = tempfile::tempdir().unwrap();
@@ -1042,6 +1075,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_version_affects_key() {
+        let _lock = key_test_lock();
         // Verify that the key version is hashed by checking that the hasher
         // receives the version string. We do this indirectly: compute a key
         // and then verify the same inputs produce the same key (determinism).
@@ -1255,6 +1289,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_changes_with_module_file() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -1298,6 +1333,7 @@ mod tests {
 
     #[test]
     fn test_cache_key_stable_with_module_files() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -1328,6 +1364,356 @@ mod tests {
         assert_eq!(
             key1, key2,
             "cache key must be deterministic with multiple source files"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // rustc cache-key correctness matrix
+    //
+    // Property under test: the key must react to every input that
+    // changes rustc's *output artifact*, and must NOT react to inputs
+    // that only affect diagnostics. A missed input is a miscache (a
+    // false hit serving the wrong artifact); a spurious change is
+    // over-keying (a missed hit, wasted work).
+    //
+    // The testable seam is `compute_cache_key` itself: it forks rustc
+    // (`get_rustc_version`, the `--emit=dep-info` pre-pass) and reads
+    // source files, so each case builds a real temp `.rs` file plus a
+    // `RustcArgs` and compares two keys. Cases that depend on env vars
+    // (`RUSTFLAGS`) mutate the process environment and are isolated
+    // onto a serial mutex so parallel test threads can't interleave.
+    // ────────────────────────────────────────────────────────────────
+
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes every test that computes a cache key.
+    ///
+    /// `compute_cache_key` reads process-wide env (`RUSTFLAGS`,
+    /// `CARGO_ENCODED_RUSTFLAGS`, `CARGO_CFG_*`); the env-mutating
+    /// matrix case below temporarily changes `RUSTFLAGS`. `cargo test`
+    /// runs tests as parallel threads of one process, so without a
+    /// shared lock any test's two key computations can straddle that
+    /// mutation and observe a spurious key difference — that is exactly
+    /// how the `assert_eq` tests `test_cache_key_deterministic` and
+    /// `test_coverage_keys_consistent_across_remap_forms` flaked on CI.
+    ///
+    /// The lock is therefore NOT matrix-scoped: every test that calls
+    /// `compute_cache_key` — matrix or not — holds it for its full
+    /// duration. New key tests must do the same; that is the price of
+    /// `compute_cache_key` reading process-global env directly.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the key-test serial lock. Tolerates a poisoned mutex (a
+    /// panic in an earlier key test) so one failure doesn't cascade
+    /// into spurious failures of the rest.
+    fn key_test_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// True if a bare `rustc` is invocable. `compute_cache_key` forks
+    /// rustc for the version probe and dep-info pre-pass; without it
+    /// the key still computes (the pre-pass falls back) but the
+    /// matrix's intent is to exercise the real path. Guard-skip when
+    /// absent, consistent with other compiler-forking tests.
+    fn rustc_available() -> bool {
+        std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Build a minimal lib-crate arg vector around a temp source file.
+    /// Callers push the dimension-under-test onto the returned vec.
+    fn base_args(source: &Path) -> Vec<String> {
+        vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mxcrate".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "--edition=2021".to_string(),
+        ]
+    }
+
+    /// Compute a key for an arg vector. The source file path is
+    /// already embedded in `args` (positional) — `RustcArgs::parse`
+    /// picks it up — so no separate source argument is needed.
+    fn key_for(args: &[String]) -> String {
+        let parsed = RustcArgs::parse(args).unwrap();
+        let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
+        compute_cache_key(&parsed, &fh, &pn).unwrap()
+    }
+
+    // ── "should change" cases — varying a codegen-affecting input ──
+
+    #[test]
+    fn key_matrix_emit_changes_key() {
+        // `cargo check` runs rustc --emit=metadata (-> .rmeta);
+        // `cargo build` runs --emit=link (-> .rlib). Same crate, same
+        // everything else the key hashes => without hashing `emit` the
+        // two collide and a check entry could be served to a build.
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let mut metadata = base_args(&source);
+        metadata.push("--emit=metadata".to_string());
+        let mut link = base_args(&source);
+        link.push("--emit=link".to_string());
+
+        assert_ne!(
+            key_for(&metadata),
+            key_for(&link),
+            "`--emit=metadata` vs `--emit=link` must produce different keys"
+        );
+    }
+
+    #[test]
+    fn key_matrix_opt_level_changes_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let mut o0 = base_args(&source);
+        o0.extend(["-C".to_string(), "opt-level=0".to_string()]);
+        let mut o3 = base_args(&source);
+        o3.extend(["-C".to_string(), "opt-level=3".to_string()]);
+
+        assert_ne!(
+            key_for(&o0),
+            key_for(&o3),
+            "`-C opt-level` must affect the key"
+        );
+    }
+
+    #[test]
+    fn key_matrix_debug_assertions_changes_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let mut on = base_args(&source);
+        on.extend(["-C".to_string(), "debug-assertions=on".to_string()]);
+        let mut off = base_args(&source);
+        off.extend(["-C".to_string(), "debug-assertions=off".to_string()]);
+
+        assert_ne!(
+            key_for(&on),
+            key_for(&off),
+            "`-C debug-assertions` must affect the key"
+        );
+    }
+
+    #[test]
+    fn key_matrix_cfg_changes_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let base = base_args(&source);
+        let mut with_cfg = base_args(&source);
+        with_cfg.extend(["--cfg".to_string(), "extra_feature".to_string()]);
+
+        assert_ne!(
+            key_for(&base),
+            key_for(&with_cfg),
+            "a `--cfg` value must affect the key"
+        );
+    }
+
+    #[test]
+    fn key_matrix_feature_changes_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let mut std_feat = base_args(&source);
+        std_feat.extend(["--cfg".to_string(), "feature=\"std\"".to_string()]);
+        let mut both = std_feat.clone();
+        both.extend(["--cfg".to_string(), "feature=\"derive\"".to_string()]);
+
+        assert_ne!(
+            key_for(&std_feat),
+            key_for(&both),
+            "adding a feature must affect the key"
+        );
+    }
+
+    #[test]
+    fn key_matrix_edition_changes_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let mut e2018 = base_args(&source);
+        e2018.retain(|a| a != "--edition=2021");
+        e2018.push("--edition=2018".to_string());
+        let e2021 = base_args(&source); // already --edition=2021
+
+        assert_ne!(
+            key_for(&e2018),
+            key_for(&e2021),
+            "`--edition` must affect the key"
+        );
+    }
+
+    #[test]
+    fn key_matrix_target_changes_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        // Two distinct triples — neither needs to be installed; the
+        // key hashes the `--target` string, it does not invoke a
+        // cross-compile.
+        let mut t1 = base_args(&source);
+        t1.push("--target=x86_64-unknown-linux-gnu".to_string());
+        let mut t2 = base_args(&source);
+        t2.push("--target=aarch64-apple-darwin".to_string());
+
+        assert_ne!(key_for(&t1), key_for(&t2), "`--target` must affect the key");
+    }
+
+    #[test]
+    fn key_matrix_crate_type_changes_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let rlib = base_args(&source); // --crate-type lib
+        let mut staticlib = base_args(&source);
+        for a in staticlib.iter_mut() {
+            if a == "lib" {
+                *a = "staticlib".to_string();
+            }
+        }
+
+        assert_ne!(
+            key_for(&rlib),
+            key_for(&staticlib),
+            "`--crate-type` must affect the key"
+        );
+    }
+
+    #[test]
+    fn key_matrix_rustflags_env_changes_key() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let args = base_args(&source);
+
+        let saved = std::env::var("RUSTFLAGS").ok();
+
+        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        unsafe { std::env::remove_var("RUSTFLAGS") };
+        let key_none = key_for(&args);
+
+        unsafe { std::env::set_var("RUSTFLAGS", "-C target-cpu=native") };
+        let key_set = key_for(&args);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("RUSTFLAGS", v) },
+            None => unsafe { std::env::remove_var("RUSTFLAGS") },
+        }
+
+        assert_ne!(key_none, key_set, "`RUSTFLAGS` env var must affect the key");
+    }
+
+    // ── "should NOT change" cases — diagnostics-only inputs ──
+    //
+    // These flags steer only what rustc *prints*, never the emitted
+    // artifact bytes. If the key changes for one of them, that is
+    // over-keying (a missed hit) — the test will fail and surface it
+    // rather than silently weakening the key.
+
+    #[test]
+    fn key_matrix_lint_level_does_not_change_key() {
+        // `-D warnings` promotes warnings to errors: it can make a
+        // build *fail*, but a build that *succeeds* emits byte-
+        // identical output with or without it. rustc does not parse
+        // `-D`/`-W`/`-A` into anything kache keys, so the key must be
+        // stable across this flag.
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let base = base_args(&source);
+        let mut with_lint = base_args(&source);
+        with_lint.extend(["-D".to_string(), "warnings".to_string()]);
+
+        assert_eq!(
+            key_for(&base),
+            key_for(&with_lint),
+            "a lint-level flag (`-D warnings`) is diagnostics-only and \
+             must NOT change the key — a change here is over-keying"
+        );
+    }
+
+    #[test]
+    fn key_matrix_error_format_does_not_change_key() {
+        // `--error-format=json` changes how diagnostics are rendered
+        // (cargo always passes it) — never the artifact. The key must
+        // not move.
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let base = base_args(&source);
+        let mut with_fmt = base_args(&source);
+        with_fmt.push("--error-format=json".to_string());
+
+        assert_eq!(
+            key_for(&base),
+            key_for(&with_fmt),
+            "`--error-format` is diagnostics-only and must NOT change \
+             the key — a change here is over-keying"
         );
     }
 }
