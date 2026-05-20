@@ -783,7 +783,7 @@ impl Compiler for CcCompiler {
         parsed.refuse_reasons()
     }
 
-    fn cache_key(&self, parsed: &CcArgs, ctx: &KeyCtx<'_>) -> Result<String> {
+    fn cache_key(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
         // Preconditions (guaranteed by the wrapper checking
         // refuse_reasons first): `-c` mode, exactly one source.
         let mut hasher = blake3::Hasher::new();

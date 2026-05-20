@@ -90,7 +90,7 @@ impl Compiler for RustcCompiler {
         reasons
     }
 
-    fn cache_key(&self, parsed: &RustcArgs, ctx: &KeyCtx<'_>) -> Result<String> {
+    fn cache_key(&self, parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
         compute_cache_key(parsed, ctx.file_hasher, ctx.path_normalizer)
     }
 

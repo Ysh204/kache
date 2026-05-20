@@ -4,7 +4,7 @@ use chrono::Utc;
 use std::path::Path;
 
 use crate::args::RustcArgs;
-use crate::cache_key::FileHasher;
+use crate::cache_key::FileHashStats;
 use crate::compile;
 use crate::compiler::cc::CcCompiler;
 use crate::compiler::rustc::RustcCompiler;
@@ -484,9 +484,16 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
 
+    let store = match store {
+        Some(store) => store,
+        None => {
+            return passthrough_with_event(config, &args, crate_name, start, "store unavailable");
+        }
+    };
+
     // Compute the cache key
     let key_start = std::time::Instant::now();
-    let file_hasher = FileHasher::new();
+    let file_hasher = store.file_hasher_with_daemon(config.socket_path());
     // Workspace root for normalization: derive from `--out-dir`
     // (see `RustcArgs::workspace_root` for the rationale — cargo
     // cd's into each transitive dep's source dir, so CWD is the
@@ -512,16 +519,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             );
         }
     };
+    let key_hash_stats = file_hasher.stats();
     let key_ms = key_start.elapsed().as_millis() as u64;
 
     tracing::debug!("cache key for {}: {}", crate_name, &cache_key[..16]);
-
-    let store = match store {
-        Some(store) => store,
-        None => {
-            return passthrough_with_event(config, &args, crate_name, start, "store unavailable");
-        }
-    };
 
     // 1. Check local store
     let lookup_start = std::time::Instant::now();
@@ -542,7 +543,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             let restore_ms = restore_start.elapsed().as_millis() as u64;
             let elapsed = start.elapsed().as_millis() as u64;
             let size: u64 = meta.files.iter().map(|f| f.size).sum();
-            log_event(
+            log_event_with_hash_stats(
                 config,
                 crate_name,
                 EventResult::LocalHit,
@@ -551,6 +552,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 size,
                 &cache_key,
                 key_ms,
+                key_hash_stats,
                 lookup_ms,
                 restore_ms,
                 0,
@@ -599,7 +601,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                    log_event(
+                    log_event_with_hash_stats(
                         config,
                         crate_name,
                         event_result,
@@ -608,6 +610,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         size,
                         &cache_key,
                         key_ms,
+                        key_hash_stats,
                         lookup_ms,
                         restore_ms,
                         0,
@@ -642,7 +645,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     let restore_ms = restore_start.elapsed().as_millis() as u64;
                     let elapsed = start.elapsed().as_millis() as u64;
                     let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                    log_event(
+                    log_event_with_hash_stats(
                         config,
                         crate_name,
                         EventResult::LocalHit,
@@ -651,6 +654,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         size,
                         &cache_key,
                         key_ms,
+                        key_hash_stats,
                         lookup_ms,
                         restore_ms,
                         0,
@@ -693,7 +697,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Don't cache failures
     if result.exit_code != 0 {
         let elapsed = start.elapsed().as_millis() as u64;
-        log_event(
+        log_event_with_hash_stats(
             config,
             crate_name,
             EventResult::Error,
@@ -702,6 +706,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
             &cache_key,
             key_ms,
+            key_hash_stats,
             lookup_ms,
             0,
             0,
@@ -774,7 +779,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .iter()
         .map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
         .sum();
-    log_event(
+    log_event_with_hash_stats(
         config,
         crate_name,
         EventResult::Miss,
@@ -783,6 +788,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         size,
         &cache_key,
         key_ms,
+        key_hash_stats,
         lookup_ms,
         0,
         store_ms,
@@ -1090,6 +1096,37 @@ fn log_event(
     restore_ms: u64,
     store_ms: u64,
 ) {
+    log_event_with_hash_stats(
+        config,
+        crate_name,
+        result,
+        elapsed_ms,
+        compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        FileHashStats::default(),
+        lookup_ms,
+        restore_ms,
+        store_ms,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_event_with_hash_stats(
+    config: &Config,
+    crate_name: &str,
+    result: EventResult,
+    elapsed_ms: u64,
+    compile_time_ms: u64,
+    size: u64,
+    cache_key: &str,
+    key_ms: u64,
+    key_hash_stats: FileHashStats,
+    lookup_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
+) {
     log_event_details(
         config,
         crate_name,
@@ -1099,6 +1136,7 @@ fn log_event(
         size,
         cache_key,
         key_ms,
+        key_hash_stats,
         lookup_ms,
         restore_ms,
         store_ms,
@@ -1124,6 +1162,7 @@ fn log_passthrough_event(
         0,
         "",
         0,
+        FileHashStats::default(),
         0,
         0,
         0,
@@ -1143,6 +1182,7 @@ fn log_event_details(
     size: u64,
     cache_key: &str,
     key_ms: u64,
+    key_hash_stats: FileHashStats,
     lookup_ms: u64,
     restore_ms: u64,
     store_ms: u64,
@@ -1159,8 +1199,11 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 5,
+        schema: 6,
         key_ms,
+        key_hash_hits: key_hash_stats.cache_hits,
+        key_hash_misses: key_hash_stats.cache_misses,
+        key_hash_bytes: key_hash_stats.bytes_hashed,
         lookup_ms,
         restore_ms,
         store_ms,

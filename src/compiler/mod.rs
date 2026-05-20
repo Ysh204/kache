@@ -73,8 +73,8 @@ impl RefuseReason {
 }
 
 /// Compiler-agnostic context passed to [`Compiler::cache_key`].
-pub struct KeyCtx<'a> {
-    pub file_hasher: &'a crate::cache_key::FileHasher,
+pub struct KeyCtx<'a, 'db> {
+    pub file_hasher: &'a crate::cache_key::FileHasher<'db>,
     /// Strips machine-local path prefixes from key inputs so the same
     /// source produces the same key across hosts and worktrees. Lives
     /// in the context (not as a free function) so future per-compiler
@@ -346,7 +346,7 @@ pub trait Compiler {
     fn refuse_reasons(&self, parsed: &Self::Parsed) -> Vec<RefuseReason>;
 
     /// Compute the cache key for a parsed invocation.
-    fn cache_key(&self, parsed: &Self::Parsed, ctx: &KeyCtx<'_>) -> Result<String>;
+    fn cache_key(&self, parsed: &Self::Parsed, ctx: &KeyCtx<'_, '_>) -> Result<String>;
 
     /// Execute the compilation, capturing exit code, stdout, stderr, and
     /// the list of output files produced.

@@ -152,6 +152,8 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
         );",
     )?;
 
+    crate::cache_key::ensure_file_hash_cache_schema(db)?;
+
     Ok(())
 }
 
@@ -205,6 +207,17 @@ impl Store {
             config: config.clone(),
             db,
         })
+    }
+
+    pub fn file_hasher(&self) -> crate::cache_key::FileHasher<'_> {
+        crate::cache_key::FileHasher::from_connection(&self.db)
+    }
+
+    pub fn file_hasher_with_daemon(
+        &self,
+        socket_path: PathBuf,
+    ) -> crate::cache_key::FileHasher<'_> {
+        self.file_hasher().with_daemon(socket_path)
     }
 
     /// Check if a committed entry exists for this cache key.
@@ -393,7 +406,6 @@ impl Store {
 
         let mut cached_files = Vec::new();
         let mut total_size = 0u64;
-
         for (source_path, store_name) in output_files {
             // 1. Hash the source file BEFORE copying
             let hash = crate::cache_key::hash_file(source_path)?;

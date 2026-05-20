@@ -25,12 +25,21 @@ pub struct BuildEvent {
     pub cache_key: String,
     /// Event schema version: 0 = legacy, 1 = prefetch-aware,
     /// 2 = compile-cost-aware, 3 = op-count-aware, 4 = probe-count-aware,
-    /// 5 = passthrough details.
+    /// 5 = passthrough details, 6 = file-hash cache metrics.
     #[serde(default)]
     pub schema: u32,
     /// Cache key computation time (ms).
     #[serde(default)]
     pub key_ms: u64,
+    /// File hashes served from the key-computation hash cache.
+    #[serde(default)]
+    pub key_hash_hits: u64,
+    /// File hashes computed by reading file contents during key computation.
+    #[serde(default)]
+    pub key_hash_misses: u64,
+    /// File bytes read and hashed during key computation.
+    #[serde(default)]
+    pub key_hash_bytes: u64,
     /// Store lookup time — SQLite query + meta read (ms).
     #[serde(default)]
     pub lookup_ms: u64,
@@ -436,8 +445,11 @@ mod tests {
             compile_time_ms,
             size,
             cache_key: cache_key.to_string(),
-            schema: 5,
+            schema: 6,
             key_ms: 0,
+            key_hash_hits: 0,
+            key_hash_misses: 0,
+            key_hash_bytes: 0,
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
@@ -464,8 +476,11 @@ mod tests {
             compile_time_ms: 250,
             size: 3145728,
             cache_key: "abc123".to_string(),
-            schema: 5,
+            schema: 6,
             key_ms: 0,
+            key_hash_hits: 0,
+            key_hash_misses: 0,
+            key_hash_bytes: 0,
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,

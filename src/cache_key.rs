@@ -1,7 +1,11 @@
 use crate::args::RustcArgs;
 use crate::path_normalizer::PathNormalizer;
 use anyhow::{Context, Result};
-use std::path::Path;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 /// Bump this when cache key logic changes in a way that could have produced
 /// incorrect entries. All entries from previous versions become unreachable.
@@ -29,6 +33,7 @@ use std::path::Path;
 /// previously leaked the build path through `comp_dir`; the remapped
 /// output is byte-incompatible with v5, so the bump invalidates it.
 const CACHE_KEY_VERSION: u32 = 6;
+const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Compute the blake3 cache key for a rustc invocation.
 ///
@@ -45,7 +50,7 @@ const CACHE_KEY_VERSION: u32 = 6;
 /// - linker identity (for bin/dylib caching)
 pub fn compute_cache_key(
     args: &RustcArgs,
-    file_hasher: &FileHasher,
+    file_hasher: &FileHasher<'_>,
     path_normalizer: &PathNormalizer,
 ) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
@@ -159,16 +164,28 @@ pub fn compute_cache_key(
         hasher.update(b"\n");
     }
 
-    // ── Group A: source files + env deps (from dep-info pre-pass) ──
-    if let Some(source) = &args.source_file {
-        let dep_info = run_dep_info_pass(&args.rustc, source, &args.all_args).unwrap_or_else(|e| {
+    let dep_info = args.source_file.as_ref().map(|source| {
+        run_dep_info_pass(&args.rustc, source, &args.all_args).unwrap_or_else(|e| {
             tracing::warn!("dep-info pre-pass failed, falling back to root: {}", e);
             DepInfo {
                 source_files: vec![source.clone()],
                 env_deps: vec![],
             }
-        });
+        })
+    });
 
+    let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
+    externs.sort_by_key(|e| &e.name);
+
+    let mut hash_paths = Vec::new();
+    if let Some(dep_info) = &dep_info {
+        hash_paths.extend(dep_info.source_files.iter().map(|p| p.as_path()));
+    }
+    hash_paths.extend(externs.iter().filter_map(|ext| ext.path.as_deref()));
+    file_hasher.prefetch(&hash_paths);
+
+    // ── Group A: source files + env deps (from dep-info pre-pass) ──
+    if let Some(dep_info) = &dep_info {
         for file in &dep_info.source_files {
             match file_hasher.hash(file) {
                 Ok(file_hash) => {
@@ -242,8 +259,6 @@ pub fn compute_cache_key(
     }
 
     // ── Group B: extern crate artifacts ──
-    let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
-    externs.sort_by_key(|e| &e.name);
     for ext in &externs {
         if let Some(path) = &ext.path {
             match file_hasher.hash(path) {
@@ -416,22 +431,338 @@ pub struct DepInfo {
     pub env_deps: Vec<(String, String)>,
 }
 
-/// Thin abstraction over file hashing. Currently a passthrough to `hash_file()`.
+/// Thin abstraction over file hashing.
 ///
-/// This exists so that Phase 2 can add memoization (cache by `(path, mtime, size)`)
-/// without changing any call site. In a workspace with 30 crates that all depend
-/// on `serde`, the serde rlib gets hashed once instead of 30 times.
-pub struct FileHasher;
+/// When backed by the persistent index DB, hashes are memoized by
+/// `(absolute path, mtime, ctime, size)` across wrapper processes. In a workspace
+/// with 30 crates that all depend on `serde`, the serde rlib gets hashed once
+/// instead of 30 times.
+pub struct FileHasher<'db> {
+    cache: Option<FileHashCache<'db>>,
+    daemon_socket: Option<PathBuf>,
+    prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
+    stats: FileHashStatsCells,
+}
 
-impl FileHasher {
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FileHashStats {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub bytes_hashed: u64,
+}
+
+#[derive(Default)]
+struct FileHashStatsCells {
+    cache_hits: Cell<u64>,
+    cache_misses: Cell<u64>,
+    bytes_hashed: Cell<u64>,
+}
+
+enum FileHashCache<'db> {
+    Borrowed(&'db Connection),
+    #[cfg(test)]
+    Owned(Connection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FileFingerprint {
+    path: String,
+    size: i64,
+    mtime_ns: i64,
+    ctime_ns: i64,
+}
+
+#[derive(Debug, Clone)]
+struct PrefetchedHash {
+    hash: String,
+    cache_hit: bool,
+    bytes_hashed: u64,
+}
+
+impl FileHasher<'static> {
     pub fn new() -> Self {
-        FileHasher
+        FileHasher {
+            cache: None,
+            daemon_socket: None,
+            prefetched: RefCell::new(HashMap::new()),
+            stats: FileHashStatsCells::default(),
+        }
     }
 
-    /// Hash a file's contents. Currently delegates directly to `hash_file()`.
-    pub fn hash(&self, path: &Path) -> Result<String> {
-        hash_file(path)
+    #[cfg(test)]
+    pub fn persistent(index_db_path: &Path) -> Self {
+        match FileHashCache::open(index_db_path) {
+            Ok(cache) => FileHasher {
+                cache: Some(cache),
+                daemon_socket: None,
+                prefetched: RefCell::new(HashMap::new()),
+                stats: FileHashStatsCells::default(),
+            },
+            Err(e) => {
+                tracing::debug!(
+                    "file hash cache disabled for {}: {e}",
+                    index_db_path.display()
+                );
+                FileHasher::new()
+            }
+        }
     }
+}
+
+impl<'db> FileHasher<'db> {
+    pub(crate) fn from_connection(db: &'db Connection) -> Self {
+        FileHasher {
+            cache: Some(FileHashCache::Borrowed(db)),
+            daemon_socket: None,
+            prefetched: RefCell::new(HashMap::new()),
+            stats: FileHashStatsCells::default(),
+        }
+    }
+
+    pub(crate) fn with_daemon(mut self, socket_path: PathBuf) -> Self {
+        self.daemon_socket = Some(socket_path);
+        self
+    }
+
+    pub fn stats(&self) -> FileHashStats {
+        FileHashStats {
+            cache_hits: self.stats.cache_hits.get(),
+            cache_misses: self.stats.cache_misses.get(),
+            bytes_hashed: self.stats.bytes_hashed.get(),
+        }
+    }
+
+    pub fn prefetch(&self, paths: &[&Path]) {
+        let Some(socket_path) = &self.daemon_socket else {
+            return;
+        };
+
+        let mut requests = Vec::new();
+        for path in paths {
+            let Ok(fingerprint) = FileFingerprint::from_path(path) else {
+                continue;
+            };
+            if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+                || self.prefetched.borrow().contains_key(&fingerprint)
+            {
+                continue;
+            }
+            requests.push(crate::daemon::HashFileRequest {
+                path: fingerprint.path,
+                size: fingerprint.size,
+                mtime_ns: fingerprint.mtime_ns,
+                ctime_ns: fingerprint.ctime_ns,
+            });
+        }
+
+        if requests.is_empty() {
+            return;
+        }
+
+        match crate::daemon::send_hash_files_request(socket_path, requests) {
+            Ok(results) => {
+                let mut prefetched = self.prefetched.borrow_mut();
+                for result in results {
+                    let Some(hash) = result.hash else {
+                        continue;
+                    };
+                    prefetched.insert(
+                        FileFingerprint {
+                            path: result.path,
+                            size: result.size,
+                            mtime_ns: result.mtime_ns,
+                            ctime_ns: result.ctime_ns,
+                        },
+                        PrefetchedHash {
+                            hash,
+                            cache_hit: result.cache_hit,
+                            bytes_hashed: result.bytes_hashed,
+                        },
+                    );
+                }
+            }
+            Err(e) => tracing::debug!("daemon file hash prefetch failed: {e}"),
+        }
+    }
+
+    /// Hash a file's contents, using the persistent cache when available.
+    pub fn hash(&self, path: &Path) -> Result<String> {
+        let Some(cache) = &self.cache else {
+            return hash_file(path);
+        };
+
+        let fingerprint = match FileFingerprint::from_path(path) {
+            Ok(fingerprint) => fingerprint,
+            Err(e) => {
+                tracing::debug!(
+                    "file hash cache metadata lookup failed for {}: {e}",
+                    path.display()
+                );
+                return hash_file(path);
+            }
+        };
+
+        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+            let hash = hash_file(path)?;
+            self.record_miss(fingerprint.size);
+            return Ok(hash);
+        }
+
+        if let Some(prefetched) = self.prefetched.borrow().get(&fingerprint) {
+            if prefetched.cache_hit {
+                self.record_hit();
+            } else {
+                self.record_miss_count();
+                self.record_miss_bytes(prefetched.bytes_hashed);
+            }
+            return Ok(prefetched.hash.clone());
+        }
+
+        match cache.get(&fingerprint) {
+            Ok(Some(hash)) => {
+                self.record_hit();
+                return Ok(hash);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!("file hash cache lookup failed for {}: {e}", path.display());
+            }
+        }
+
+        let hash = hash_file(path)?;
+        self.record_miss(fingerprint.size);
+        if let Err(e) = cache.put(&fingerprint, &hash) {
+            tracing::debug!("file hash cache update failed for {}: {e}", path.display());
+        }
+        Ok(hash)
+    }
+
+    fn record_hit(&self) {
+        self.stats.cache_hits.set(self.stats.cache_hits.get() + 1);
+    }
+
+    fn record_miss(&self, size: i64) {
+        self.record_miss_count();
+        if let Ok(size) = u64::try_from(size) {
+            self.record_miss_bytes(size);
+        }
+    }
+
+    fn record_miss_count(&self) {
+        self.stats
+            .cache_misses
+            .set(self.stats.cache_misses.get() + 1);
+    }
+
+    fn record_miss_bytes(&self, bytes: u64) {
+        self.stats
+            .bytes_hashed
+            .set(self.stats.bytes_hashed.get().saturating_add(bytes));
+    }
+}
+
+impl<'db> FileHashCache<'db> {
+    #[cfg(test)]
+    fn open(index_db_path: &Path) -> Result<Self> {
+        let db = Connection::open(index_db_path)
+            .with_context(|| format!("opening file hash cache {}", index_db_path.display()))?;
+        db.pragma_update(None, "busy_timeout", "5000")?;
+        db.pragma_update(None, "journal_mode", "WAL")?;
+        db.pragma_update(None, "synchronous", "NORMAL")?;
+        ensure_file_hash_cache_schema(&db)?;
+        Ok(Self::Owned(db))
+    }
+
+    fn db(&self) -> &Connection {
+        match self {
+            Self::Borrowed(db) => db,
+            #[cfg(test)]
+            Self::Owned(db) => db,
+        }
+    }
+
+    fn get(&self, fingerprint: &FileFingerprint) -> rusqlite::Result<Option<String>> {
+        self.db()
+            .query_row(
+                "SELECT hash FROM file_hashes
+                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND ctime_ns = ?4",
+                params![
+                    fingerprint.path,
+                    fingerprint.size,
+                    fingerprint.mtime_ns,
+                    fingerprint.ctime_ns
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    fn put(&self, fingerprint: &FileFingerprint, hash: &str) -> rusqlite::Result<()> {
+        self.db().execute(
+            "INSERT OR REPLACE INTO file_hashes
+             (path, size, mtime_ns, ctime_ns, hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            params![
+                fingerprint.path,
+                fingerprint.size,
+                fingerprint.mtime_ns,
+                fingerprint.ctime_ns,
+                hash
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+pub(crate) fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_hashes (
+            path       TEXT PRIMARY KEY,
+            size       INTEGER NOT NULL,
+            mtime_ns   INTEGER NOT NULL,
+            ctime_ns   INTEGER NOT NULL DEFAULT 0,
+            hash       TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )?;
+    if let Err(e) =
+        db.execute_batch("ALTER TABLE file_hashes ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0")
+        && !e.to_string().contains("duplicate column name")
+    {
+        return Err(e);
+    }
+    Ok(())
+}
+
+impl FileFingerprint {
+    fn from_path(path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("reading metadata for {}", path.display()))?;
+        let absolute_path = absolute_path(path);
+
+        Ok(Self {
+            path: absolute_path.to_string_lossy().into_owned(),
+            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            mtime_ns: unix_metadata_ns(metadata.mtime(), metadata.mtime_nsec()),
+            ctime_ns: unix_metadata_ns(metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn unix_metadata_ns(seconds: i64, nanoseconds: i64) -> i64 {
+    seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nanoseconds)
 }
 
 /// Run `rustc --emit=dep-info` as a pre-pass to discover source files and env deps.
