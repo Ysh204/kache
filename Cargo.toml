@@ -1,6 +1,6 @@
 [package]
 name = "kache"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Zero-copy, content-addressed Rust build cache. No copies, no wasted disk — just hardlinks locally and S3 for sharing."
 license = "Apache-2.0"
