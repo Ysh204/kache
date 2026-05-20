@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1094,10 +1093,8 @@ impl Daemon {
             match std::fs::metadata(&file.path) {
                 Ok(metadata)
                     if i64::try_from(metadata.len()).unwrap_or(i64::MAX) == file.size
-                        && metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec()
-                            == file.mtime_ns
-                        && metadata.ctime() * 1_000_000_000 + metadata.ctime_nsec()
-                            == file.ctime_ns => {}
+                        && crate::cache_key::metadata_mtime_ns(&metadata) == file.mtime_ns
+                        && crate::cache_key::metadata_ctime_ns(&metadata) == file.ctime_ns => {}
                 Ok(_) => {
                     results.push(HashFileResult {
                         path: file.path.clone(),
@@ -3599,7 +3596,6 @@ fn wait_for_socket_until(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
     use std::sync::mpsc;
 
     // Tests use the same cross-platform transport as production. On Unix
@@ -4545,8 +4541,8 @@ mod tests {
             files: vec![HashFileRequest {
                 path: file.to_string_lossy().into_owned(),
                 size: i64::try_from(metadata.len()).unwrap(),
-                mtime_ns: metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
-                ctime_ns: metadata.ctime() * 1_000_000_000 + metadata.ctime_nsec(),
+                mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
+                ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
             }],
         };
 

@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Bump this when cache key logic changes in a way that could have produced
@@ -743,8 +742,8 @@ impl FileFingerprint {
         Ok(Self {
             path: absolute_path.to_string_lossy().into_owned(),
             size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-            mtime_ns: unix_metadata_ns(metadata.mtime(), metadata.mtime_nsec()),
-            ctime_ns: unix_metadata_ns(metadata.ctime(), metadata.ctime_nsec()),
+            mtime_ns: metadata_mtime_ns(&metadata),
+            ctime_ns: metadata_ctime_ns(&metadata),
         })
     }
 }
@@ -759,10 +758,75 @@ fn absolute_path(path: &Path) -> PathBuf {
     }
 }
 
-fn unix_metadata_ns(seconds: i64, nanoseconds: i64) -> i64 {
+pub(crate) fn metadata_mtime_ns(metadata: &std::fs::Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        metadata_parts_ns(metadata.mtime(), metadata.mtime_nsec())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        windows_filetime_ns(metadata.last_write_time())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        system_time_ns(metadata.modified().ok()).unwrap_or_default()
+    }
+}
+
+pub(crate) fn metadata_ctime_ns(metadata: &std::fs::Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        metadata_parts_ns(metadata.ctime(), metadata.ctime_nsec())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        windows_filetime_ns(metadata.creation_time())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        system_time_ns(metadata.created().ok()).unwrap_or_else(|| metadata_mtime_ns(metadata))
+    }
+}
+
+#[cfg(unix)]
+fn metadata_parts_ns(seconds: i64, nanoseconds: i64) -> i64 {
     seconds
         .saturating_mul(1_000_000_000)
         .saturating_add(nanoseconds)
+}
+
+#[cfg(windows)]
+fn windows_filetime_ns(filetime_100ns: u64) -> i64 {
+    const UNIX_EPOCH_FILETIME_100NS: u64 = 116_444_736_000_000_000;
+
+    filetime_100ns
+        .saturating_sub(UNIX_EPOCH_FILETIME_100NS)
+        .saturating_mul(100)
+        .min(i64::MAX as u64) as i64
+}
+
+#[cfg(not(any(unix, windows)))]
+fn system_time_ns(time: Option<std::time::SystemTime>) -> Option<i64> {
+    let duration = time?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX / 1_000_000_000);
+
+    Some(
+        seconds
+            .saturating_mul(1_000_000_000)
+            .saturating_add(i64::from(duration.subsec_nanos())),
+    )
 }
 
 /// Run `rustc --emit=dep-info` as a pre-pass to discover source files and env deps.
