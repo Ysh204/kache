@@ -1025,10 +1025,11 @@ fn restore_from_cache(
 
     // Anchor for dep-info (`.d`) path expansion. Cached `.d` blobs hold
     // paths relativized against the *producing* build's target dir
-    // (`<target>/...` → `./...`); on restore they must be re-rooted at
-    // *this* invocation's target dir so cargo's freshness `stat()`s find
-    // them. `args.target_dir()` derives that from `--out-dir` / `-o` —
-    // cargo's cwd is the package source dir, so it cannot be used.
+    // (`<target>/...` → kache's dep-info sentinel); on restore they must
+    // be re-rooted at *this* invocation's target dir so cargo's freshness
+    // `stat()`s find them. `args.target_dir()` derives that from
+    // `--out-dir` / `-o` — cargo's cwd is the package source dir, so it
+    // cannot be used.
     // Falls back to cwd only for ad-hoc invocations outside cargo's
     // layout, where there is no cached `.d` to rewrite anyway.
     let depinfo_anchor = args
@@ -1512,7 +1513,7 @@ mod tests {
         rewrite_depinfo_outputs(&outputs, producing_target, link::DepInfoMode::Relativize);
         let stored = std::fs::read_to_string(&depfile).unwrap();
         assert!(
-            stored.starts_with("./release/deps/libfoo-abc.rlib:"),
+            stored.starts_with("__kache_root__/release/deps/libfoo-abc.rlib:"),
             "stored `.d` must be relativized, got: {stored}"
         );
         assert!(
@@ -1521,7 +1522,9 @@ mod tests {
         );
         let stored_mozilla = std::fs::read_to_string(&mozilla_depfile).unwrap();
         assert!(
-            stored_mozilla.starts_with("./config/host_pathsub.o: ./config/pathsub.c"),
+            stored_mozilla.starts_with(
+                "__kache_root__/config/host_pathsub.o: __kache_root__/config/pathsub.c"
+            ),
             "stored `.pp` must be relativized, got: {stored_mozilla}"
         );
 
