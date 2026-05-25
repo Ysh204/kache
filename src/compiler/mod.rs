@@ -49,15 +49,40 @@ pub enum CompilerKind {
 }
 
 /// Reason an invocation cannot be cached. Empty list = cacheable.
+///
+/// Two variants:
+///
+/// - `NotPrimary`: the invocation is a query / probe (`--print`,
+///   `-vV`) that exists to provide information to the caller, not to
+///   produce a build artifact for downstream consumption. Caching is
+///   meaningless — the call is one-shot informational.
+/// - `Unsupported`: kache could in principle cache this, but the
+///   feature / flag / mode isn't modeled yet. EVERYTHING that's
+///   technically cacheable-with-engineering-effort lands here:
+///   link-mode caching, multi-source per-source split, preprocessor /
+///   assembly variant outputs, output-to-stdout, response-file
+///   expansion, PCH / modules, classifier gaps. Message MUST include
+///   "(not yet supported)" or equivalent so users reading the bench
+///   output can tell it's a deferral, not a permanent limitation.
+///
+/// There is deliberately no third "won't ever cache" variant. For cc
+/// (and rustc) every deterministic input-to-output function IS
+/// cacheable in principle — even `-E` preprocessor output, even `-S`
+/// assembly output, even stdout bytes. What separates them from `-c`
+/// today is engineering priority, not categorical impossibility. The
+/// taxonomy reflects that honestly so future work to support any of
+/// them can drop a row to `Unsupported` and find this comment
+/// describing the deferral, rather than running into a "NotACompile"
+/// variant whose name lies about feasibility.
 #[derive(Debug, Clone)]
 pub enum RefuseReason {
     /// Not a primary compilation (e.g. `--print`, `-vV`, query mode).
     NotPrimary,
-    /// Compiler-specific feature not yet supported by kache. Static string
-    /// is a stable identifier suitable for logging / metrics. Used today
-    /// by the C-family skeleton (refuses everything until real caching
-    /// lands) and reserved for future per-compiler "we know this flag
-    /// exists but can't safely cache it" cases.
+    /// Kache could cache this with engineering effort but doesn't yet.
+    /// Message should include "(not yet supported)" so the deferral
+    /// nature is explicit. Examples: link mode, multi-source compile,
+    /// preprocessor / assembly variant outputs, output-to-stdout,
+    /// response files, PCH, modules, unmodeled classifier flags.
     Unsupported(&'static str),
 }
 
