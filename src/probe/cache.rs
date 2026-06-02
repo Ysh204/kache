@@ -26,6 +26,8 @@ const PROBE_SUBDIR: &str = "probes";
 pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
     let resolved = resolve_program(req.compiler)?;
     let meta = std::fs::metadata(&resolved).ok()?;
+    let fingerprint = compiler_fingerprint(&meta);
+    let env_fp = env_fingerprint();
 
     let mut h = blake3::Hasher::new();
     h.update(b"probe_schema:");
@@ -35,7 +37,7 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
     h.update(b"\ncompiler_path:");
     h.update(resolved.to_string_lossy().as_bytes());
     h.update(b"\ncompiler_stat:");
-    h.update(compiler_fingerprint(&meta).as_bytes());
+    h.update(fingerprint.as_bytes());
     // The resolved-invocation probe (`cc -###`) depends on the compile
     // flags and the environment, so both join the key. Without this a
     // record memoized under one flag set or one `SDKROOT` could be
@@ -46,12 +48,11 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
         h.update(b"\x1f");
     }
     h.update(b"\nenv:");
-    h.update(env_fingerprint().as_bytes());
+    h.update(env_fp.as_bytes());
     Some(h.finalize().to_hex().to_string())
 }
 
-/// Hash of the process environment — every `VAR=value` pair, sorted
-/// for determinism.
+/// Hash of the process environment — see [`fingerprint_env`].
 ///
 /// `cc -###` inherits this environment, so a change to it (a different
 /// `SDKROOT`, `CPATH`, …) can change the resolved invocation. Hashing
@@ -59,7 +60,15 @@ pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
 /// change at worst forces one extra, cheap re-probe, while a relevant
 /// one can never be served a stale record.
 fn env_fingerprint() -> String {
-    let mut vars: Vec<(String, String)> = std::env::vars().collect();
+    fingerprint_env(std::env::vars())
+}
+
+/// Hash every `VAR=value` pair in `vars`, sorted for determinism, after
+/// dropping the volatile pseudo-variables [`is_volatile_env_name`]
+/// rejects. Split from [`env_fingerprint`] so the filtering is testable
+/// without mutating the real process environment.
+fn fingerprint_env(vars: impl Iterator<Item = (String, String)>) -> String {
+    let mut vars: Vec<(String, String)> = vars.filter(|(k, _)| !is_volatile_env_name(k)).collect();
     vars.sort();
     let mut h = blake3::Hasher::new();
     for (k, v) in vars {
@@ -69,6 +78,21 @@ fn env_fingerprint() -> String {
         h.update(b"\n");
     }
     h.finalize().to_hex().to_string()
+}
+
+/// True for environment-variable names that vary between otherwise
+/// identical build invocations and so must stay out of the probe key.
+///
+/// Windows' process environment carries hidden cmd.exe bookkeeping
+/// variables whose names begin with `=`: the per-drive working directory
+/// (`=C:`, `=D:`, …) and the previous child's exit status (`=ExitCode`).
+/// `std::env::vars()` surfaces them, yet they are never inputs to
+/// `cc -###` and they shift between the cold and warm builds — which made
+/// the on-disk probe memo miss on the warm build, re-running the probe
+/// (#201). A Unix variable name cannot contain `=`, so this never fires
+/// there.
+fn is_volatile_env_name(name: &str) -> bool {
+    name.starts_with('=')
 }
 
 /// Load a probe record by key, or `None` on any miss: file absent,
@@ -131,17 +155,53 @@ fn compiler_fingerprint(meta: &Metadata) -> String {
 /// to CWD if relative). A bare name (`cc`, `clang-17`) is searched on
 /// `$PATH`, mirroring how the OS resolves it at exec time. Returns
 /// `None` if nothing matches.
+///
+/// On Windows the executable carries a `.exe` suffix the fixture's
+/// compiler name (`cc`) omits, so each candidate is tried both as
+/// written and with [`EXE_SUFFIX`](std::env::consts::EXE_SUFFIX)
+/// appended. Without this the PATH search never matched `cc.exe`, so
+/// [`probe_key`] returned `None` and the probe was never memoized —
+/// re-running on every build (the #201 warm `probe_runs=1`). No-op on
+/// Unix where `EXE_SUFFIX` is empty.
 fn resolve_program(program: &str) -> Option<PathBuf> {
     let p = Path::new(program);
     let has_separator = p.parent().is_some_and(|par| !par.as_os_str().is_empty());
     if has_separator {
-        return p.canonicalize().ok();
+        return with_exe_suffix(p.to_path_buf(), std::env::consts::EXE_SUFFIX)
+            .into_iter()
+            .find_map(|candidate| candidate.canonicalize().ok());
     }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    find_program_in_dirs(program, &dirs, std::env::consts::EXE_SUFFIX)
         .and_then(|candidate| candidate.canonicalize().ok())
+}
+
+/// `path` followed by `path` + `exe_suffix` (when the suffix is non-empty
+/// and not already present), in priority order. Pure — used by both the
+/// PATH search and the explicit-path branch of [`resolve_program`].
+fn with_exe_suffix(path: PathBuf, exe_suffix: &str) -> Vec<PathBuf> {
+    let already = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext == exe_suffix.trim_start_matches('.'));
+    if exe_suffix.is_empty() || already {
+        return vec![path];
+    }
+    let mut suffixed = path.clone().into_os_string();
+    suffixed.push(exe_suffix);
+    vec![path, PathBuf::from(suffixed)]
+}
+
+/// First existing file matching `program` (then `program+exe_suffix`) in
+/// any of `dirs`, in PATH order. Split out so the suffix logic is
+/// testable on any host.
+fn find_program_in_dirs(program: &str, dirs: &[PathBuf], exe_suffix: &str) -> Option<PathBuf> {
+    dirs.iter().find_map(|dir| {
+        with_exe_suffix(dir.join(program), exe_suffix)
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 #[cfg(test)]
@@ -166,6 +226,54 @@ mod tests {
             args: &[],
             key_args: &[],
         }
+    }
+
+    #[test]
+    fn fingerprint_env_ignores_windows_hidden_pseudo_vars() {
+        // The #201 root cause: on Windows `std::env::vars()` yields
+        // cmd.exe's volatile `=`-prefixed vars (per-drive CWD `=C:`, last
+        // child's `=ExitCode`). They differ between the cold and warm
+        // builds, so including them made the probe key — and thus the
+        // memo — unstable. Adding them must not change the fingerprint.
+        let real = [
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("SDKROOT".to_string(), "/sdk".to_string()),
+        ];
+        let with_hidden = [
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("SDKROOT".to_string(), "/sdk".to_string()),
+            ("=C:".to_string(), r"C:\work\cold".to_string()),
+            ("=ExitCode".to_string(), "00000000".to_string()),
+        ];
+        assert_eq!(
+            fingerprint_env(real.iter().cloned()),
+            fingerprint_env(with_hidden.iter().cloned()),
+            "`=`-prefixed Windows pseudo-vars must not affect the probe key"
+        );
+    }
+
+    #[test]
+    fn fingerprint_env_still_reflects_real_vars() {
+        // The filter must not blunt the key: a genuine env change (a
+        // different SDKROOT, which `cc -###` honors) must still move it.
+        let a = [("SDKROOT".to_string(), "/sdk/a".to_string())];
+        let b = [("SDKROOT".to_string(), "/sdk/b".to_string())];
+        assert_ne!(
+            fingerprint_env(a.iter().cloned()),
+            fingerprint_env(b.iter().cloned()),
+            "a real env change must still change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn is_volatile_env_name_flags_only_equals_prefixed() {
+        assert!(is_volatile_env_name("=C:"));
+        assert!(is_volatile_env_name("=ExitCode"));
+        assert!(!is_volatile_env_name("PATH"));
+        assert!(!is_volatile_env_name("SDKROOT"));
+        // A normal name that merely contains `=` later cannot occur, but
+        // guard the boundary: only a leading `=` is volatile.
+        assert!(!is_volatile_env_name("A=B"));
     }
 
     #[test]
@@ -196,6 +304,53 @@ mod tests {
     #[test]
     fn probe_key_is_none_for_a_missing_compiler() {
         assert!(probe_key("cc", &req("/nonexistent/kache-cc-xyz")).is_none());
+    }
+
+    #[test]
+    fn with_exe_suffix_appends_when_set_and_absent() {
+        assert_eq!(
+            with_exe_suffix(PathBuf::from("/p/cc"), ".exe"),
+            vec![PathBuf::from("/p/cc"), PathBuf::from("/p/cc.exe")]
+        );
+    }
+
+    #[test]
+    fn with_exe_suffix_is_single_for_empty_suffix_or_already_present() {
+        assert_eq!(
+            with_exe_suffix(PathBuf::from("/p/cc"), ""),
+            vec![PathBuf::from("/p/cc")]
+        );
+        assert_eq!(
+            with_exe_suffix(PathBuf::from("/p/cc.exe"), ".exe"),
+            vec![PathBuf::from("/p/cc.exe")]
+        );
+    }
+
+    #[test]
+    fn find_program_in_dirs_matches_suffixed_executable() {
+        // The #201 shape: PATH holds `cc.exe`, fixture names `cc`. With a
+        // `.exe` suffix the search must find it; without (Unix), it must not.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("cc.exe"), b"MZ").unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        assert_eq!(
+            find_program_in_dirs("cc", &dirs, ".exe"),
+            Some(dir.path().join("cc.exe"))
+        );
+        assert!(find_program_in_dirs("cc", &dirs, "").is_none());
+    }
+
+    #[test]
+    fn find_program_in_dirs_prefers_unsuffixed_when_present() {
+        // A bare on-disk `cc` (the Unix shape) is found as-is, before any
+        // suffixed candidate.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("cc"), b"#!/bin/sh\n").unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        assert_eq!(
+            find_program_in_dirs("cc", &dirs, ".exe"),
+            Some(dir.path().join("cc"))
+        );
     }
 
     #[test]

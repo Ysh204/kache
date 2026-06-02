@@ -54,7 +54,16 @@ use std::path::{Path, PathBuf};
 /// ordinary make depfile paths such as `../foo.h`, whose second dot
 /// contains a `./` substring and could be expanded incorrectly on
 /// restore.
-const CACHE_KEY_VERSION: u32 = 9;
+///
+/// v10: source files are hashed in content-hash order instead of
+/// absolute-path order (a build-script-generated file under `OUT_DIR`
+/// sorted differently once the build tree moved, leaking path-order into
+/// the key and breaking relocated cache hits — #201). The update order
+/// changes on EVERY platform, not just Windows, so the same crate hashes
+/// to a different key; bump to invalidate v9 entries cleanly rather than
+/// leave a silent partial invalidation. (Env-dep values are also now
+/// un-escaped, which can change Windows OUT_DIR keys.)
+const CACHE_KEY_VERSION: u32 = 10;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -252,19 +261,21 @@ pub fn compute_cache_key(
 
     // ── Group A: source files + env deps (from dep-info pre-pass) ──
     if let Some(dep_info) = &dep_info {
+        // Hash source files in CONTENT-HASH order, not path order. Only
+        // the content hash enters the key (not the path), so the set of
+        // contents is what matters — and `dep_info.source_files` is
+        // sorted by absolute path, which is NOT path-independent: a
+        // build-script-generated file under `OUT_DIR` sorts among the
+        // registry sources differently once the build tree moves (e.g.
+        // `C:\Windows\...\tmp\...` vs `C:\actions-runner\...`), flipping
+        // the update order and changing the key — so a relocated build
+        // missed (kunobi-ninja/kache#201). Sorting by hash makes the
+        // order depend only on contents.
+        let mut hashed: Vec<(String, &std::path::Path)> =
+            Vec::with_capacity(dep_info.source_files.len());
         for file in &dep_info.source_files {
             match file_hasher.hash(file) {
-                Ok(file_hash) => {
-                    hasher.update(b"source:");
-                    hasher.update(file_hash.as_bytes());
-                    hasher.update(b"\n");
-                    tracing::trace!(
-                        "[key:{}] source:{}={}",
-                        crate_name,
-                        file.display(),
-                        &file_hash[..16]
-                    );
-                }
+                Ok(file_hash) => hashed.push((file_hash, file.as_path())),
                 Err(e) => {
                     tracing::warn!(
                         "[key:{}] failed to hash source {}: {}",
@@ -274,6 +285,18 @@ pub fn compute_cache_key(
                     );
                 }
             }
+        }
+        hashed.sort();
+        for (file_hash, file) in &hashed {
+            hasher.update(b"source:");
+            hasher.update(file_hash.as_bytes());
+            hasher.update(b"\n");
+            tracing::trace!(
+                "[key:{}] source:{}={}",
+                crate_name,
+                file.display(),
+                &file_hash[..16]
+            );
         }
 
         for (var, val) in &dep_info.env_deps {
@@ -1111,7 +1134,7 @@ fn parse_env_dep_info(dep_info: &str) -> Vec<(String, String)> {
     for line in dep_info.lines() {
         if let Some(env_dep) = line.strip_prefix("# env-dep:") {
             if let Some((var, val)) = env_dep.split_once('=') {
-                env_deps.push((var.to_string(), val.to_string()));
+                env_deps.push((var.to_string(), unescape_env_dep_value(val)));
             } else {
                 env_deps.push((env_dep.to_string(), String::new()));
             }
@@ -1119,6 +1142,40 @@ fn parse_env_dep_info(dep_info: &str) -> Vec<(String, String)> {
     }
     env_deps.sort_by(|(a, _), (b, _)| a.cmp(b));
     env_deps
+}
+
+/// Reverse rustc's `# env-dep:` value escaping.
+///
+/// rustc writes env-dep values through `escape_dep_env`, which emits
+/// `\` as `\\`, newline as `\n`, and carriage return as `\r` so the
+/// value stays on one line. Without undoing it, a Windows path arrives
+/// doubled (`C:\\foo\\bar`); the cache-key path normalizer's rules use
+/// single backslashes, so the value never matched and `OUT_DIR` leaked
+/// its absolute path into the key — defeating cross-path cache hits on
+/// Windows (kunobi-ninja/kache#201). On Unix, paths rarely contain
+/// backslashes, so this was latent.
+fn unescape_env_dep_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            // Unknown escape: keep both bytes so the value round-trips
+            // rather than silently dropping the backslash.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Get rustc version string, cached to a file keyed by binary mtime.
@@ -1222,6 +1279,34 @@ fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::args::RustcArgs;
+
+    #[test]
+    fn unescape_env_dep_value_undoes_rustc_escaping() {
+        // rustc's `escape_dep_env`: `\`→`\\`, newline→`\n`, CR→`\r`.
+        // A Windows OUT_DIR arrives doubled; unescaping restores the
+        // single-backslash path so the normalizer's rules can match it.
+        assert_eq!(
+            unescape_env_dep_value(r"C:\\actions-runner\\proj\\target\\out"),
+            r"C:\actions-runner\proj\target\out"
+        );
+        assert_eq!(unescape_env_dep_value(r"a\nb\rc"), "a\nb\rc");
+        // Forward-slash / plain values (the Unix case) are untouched.
+        assert_eq!(
+            unescape_env_dep_value("/home/u/proj/out"),
+            "/home/u/proj/out"
+        );
+        assert_eq!(unescape_env_dep_value("plain-value"), "plain-value");
+    }
+
+    #[test]
+    fn parse_env_dep_info_unescapes_windows_paths() {
+        let dep = "# env-dep:OUT_DIR=C:\\\\proj\\\\build\\\\out\n";
+        let deps = parse_env_dep_info(dep);
+        assert_eq!(
+            deps,
+            vec![("OUT_DIR".to_string(), r"C:\proj\build\out".to_string())]
+        );
+    }
 
     #[test]
     fn test_hash_file() {

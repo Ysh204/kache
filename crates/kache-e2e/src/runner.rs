@@ -14,7 +14,7 @@
 //! metric assertions impossible to write tightly.
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -439,7 +439,7 @@ fn differential_relocate_check(
     let mut restored: Vec<(String, Vec<u8>)> = Vec::with_capacity(diff.artifacts.len());
     let mut failures: Vec<AssertionCheck> = Vec::new();
     for artifact in &diff.artifacts {
-        match std::fs::read(relocated.join(artifact)) {
+        match read_declared_artifact(relocated, artifact) {
             Ok(bytes) => restored.push((artifact.clone(), bytes)),
             Err(e) => failures.push(AssertionCheck {
                 name: "relocate_diff_restored_present",
@@ -494,7 +494,7 @@ fn differential_relocate_check(
     // against the cache-restored snapshot from step (1).
     let mut checks = Vec::with_capacity(restored.len());
     for (artifact, restored_bytes) in &restored {
-        match std::fs::read(relocated.join(artifact)) {
+        match read_declared_artifact(relocated, artifact) {
             Ok(fresh) => {
                 checks.push(relocate_diff_artifact_check(
                     artifact,
@@ -696,7 +696,7 @@ fn run_phase(
     // design — neither is a hit-vs-fresh comparison.)
     if let Some(diff) = &fixture.diff {
         for artifact in &diff.artifacts {
-            match std::fs::read(cwd.join(artifact)) {
+            match read_declared_artifact(cwd, artifact) {
                 Ok(bytes) => match phase {
                     Phase::Cold => {
                         diff_baseline.insert(artifact.clone(), bytes);
@@ -786,7 +786,30 @@ struct StepOutcome {
 /// phase, so the build runs against a pristine tree at a different
 /// path. Performance is not a concern — the largest fixture is a
 /// few hundred KB of source.
-fn prepare_relocated_dir(src: &Path) -> Result<TempDir> {
+/// A relocated fixture copy. Owns the [`TempDir`] for RAII cleanup but
+/// exposes a **long-form** root path via [`path`](Self::path).
+///
+/// On Windows the system tempdir is often an 8.3 short path (the
+/// self-hosted runner's `NetworkService` profile resolves `TEMP` to
+/// `C:\Windows\SERVIC~1\NETWOR~1\...`). cargo derives `OUT_DIR` from the
+/// build cwd in that same short form, but kache's path-normalizer
+/// canonicalizes its rule prefixes to long form — so the short `OUT_DIR`
+/// never matched and leaked into the cache key, making the relocate phase
+/// miss (kunobi-ninja/kache#201). Building under the canonicalized long
+/// path keeps `OUT_DIR` in the form the normalizer expects. No-op on Unix
+/// (canonicalize only resolves symlinks there).
+struct RelocatedDir {
+    _temp: TempDir,
+    root: PathBuf,
+}
+
+impl RelocatedDir {
+    fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+fn prepare_relocated_dir(src: &Path) -> Result<RelocatedDir> {
     let dst = TempDir::new().context("creating relocated tempdir")?;
     let status = Command::new("cp")
         .arg("-R")
@@ -803,7 +826,21 @@ fn prepare_relocated_dir(src: &Path) -> Result<TempDir> {
         );
     }
     copy_toolchain_pin(src, dst.path());
-    Ok(dst)
+    // WINDOWS ONLY: long-form, `\\?\`-stripped root (see [`RelocatedDir`]).
+    // On Unix this canonicalize is both unnecessary (no 8.3 short names)
+    // and harmful: it resolves the macOS `/tmp` → `/private/tmp` symlink,
+    // which perturbs rustup's `rust-toolchain.toml` resolution at the
+    // relocated cwd (the build picks a different toolchain → different
+    // `rustc_version` → spurious relocate misses). Keep the tempdir path
+    // verbatim on Unix so relocate behaves exactly as before this change.
+    let root = if cfg!(windows) {
+        std::fs::canonicalize(dst.path())
+            .map(|c| crate::portable_path(&c))
+            .unwrap_or_else(|_| dst.path().to_path_buf())
+    } else {
+        dst.path().to_path_buf()
+    };
+    Ok(RelocatedDir { _temp: dst, root })
 }
 
 /// Carry the active Rust toolchain pin into the relocated tree.
@@ -965,6 +1002,15 @@ fn run_verify(spec: &Verify, fixture: &Fixture, cwd: &Path, cache_dir: &Path) ->
 /// is best-effort defense-in-depth, not a load-bearing check. The
 /// metric assertions and the runtime verify already exist; this just
 /// adds another lens on top.
+///
+/// LIMITATION: this lens is effectively Unix-only — `strings` (binutils)
+/// is not provisioned on the Windows runner, so it skips there, and the
+/// fixtures' `forbidden_substrings` list Unix-form prefixes. The
+/// cross-platform guard against build-path leaks is the byte-equality
+/// `relocate_diff_match` check, which runs everywhere; this `strings`
+/// scan is a redundant Unix lens on top. (A raw-byte scan was tried to
+/// make it work on Windows but false-positived on the toolchain's
+/// embedded std-source path, so it was reverted.)
 fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<String> {
     if forbidden.is_empty() {
         return None;
@@ -975,20 +1021,24 @@ fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<Str
     // with more exotic verify commands can opt out by leaving
     // `forbidden_substrings` empty.
     let bin_token = run_cmd.split_whitespace().next()?;
-    let bin_path = if bin_token.starts_with('/') {
-        std::path::PathBuf::from(bin_token)
+    let raw_path = if bin_token.starts_with('/') {
+        PathBuf::from(bin_token)
     } else {
         cwd.join(bin_token)
     };
-    if !bin_path.exists() {
+    // The fixture's verify command names a suffix-less relative path
+    // (`./target/release/foo`); on Windows the real artifact is
+    // `foo.exe`. Resolve the actual on-disk file, trying the path as
+    // written first and the platform-suffixed variant second.
+    let Some(bin_path) = resolve_artifact(&raw_path) else {
         // Defensive — if the verify command has already failed at
         // the spawn step, we wouldn't be here. So a missing binary
         // is more likely a fixture misconfig.
         return Some(format!(
             "binary inspection: artifact not found at `{}`",
-            bin_path.display()
+            crate::portable_path(&raw_path).display()
         ));
-    }
+    };
 
     let strings_output = Command::new("strings")
         .arg(&bin_path)
@@ -1019,6 +1069,51 @@ fn inspect_binary(run_cmd: &str, cwd: &Path, forbidden: &[String]) -> Option<Str
         }
     }
     None
+}
+
+/// Candidate on-disk paths for an inspected artifact, in priority
+/// order. [`portable_path`](crate::portable_path) first tidies the mixed
+/// `\.`/`/` separators that [`Path::join`] leaves on Windows. Then, when
+/// `exe_suffix` is non-empty and not already present, a suffixed variant
+/// is appended as a fallback (the fixture names `./target/release/foo`
+/// but Windows produces `foo.exe`). Pure — no filesystem access — so the
+/// suffix logic is testable on any host.
+fn artifact_candidates(path: &Path, exe_suffix: &str) -> Vec<PathBuf> {
+    let portable = crate::portable_path(path);
+    let mut candidates = vec![portable.clone()];
+    let already_suffixed = portable
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext == exe_suffix.trim_start_matches('.'));
+    if !exe_suffix.is_empty() && !already_suffixed {
+        let mut suffixed = portable.into_os_string();
+        suffixed.push(exe_suffix);
+        candidates.push(PathBuf::from(suffixed));
+    }
+    candidates
+}
+
+/// The first existing [`artifact_candidates`] entry for `path`, using the
+/// platform's [`EXE_SUFFIX`](std::env::consts::EXE_SUFFIX). `None` if no
+/// candidate exists on disk. No-op fallback on Unix where `EXE_SUFFIX` is
+/// empty.
+fn resolve_artifact(path: &Path) -> Option<PathBuf> {
+    artifact_candidates(path, std::env::consts::EXE_SUFFIX)
+        .into_iter()
+        .find(|c| c.exists())
+}
+
+/// Read a fixture-declared artifact under `base`, applying the same
+/// platform-exe-suffix resolution as [`resolve_artifact`].
+///
+/// Fixtures name diff/run artifacts without a suffix (`target/release/foo`);
+/// on Windows the real file is `foo.exe`. Reading the literal joined path
+/// would `ENOENT`. Falls back to the unresolved join so a genuinely missing
+/// artifact still produces a meaningful "not found" error.
+fn read_declared_artifact(base: &Path, artifact: &str) -> std::io::Result<Vec<u8>> {
+    let raw = base.join(artifact);
+    let resolved = resolve_artifact(&raw).unwrap_or(raw);
+    std::fs::read(resolved)
 }
 
 /// Scan every dep-info (`.d`) file under `root` for kache's target-dir
@@ -1067,7 +1162,53 @@ fn inspect_restored_depinfo(root: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::inspect_restored_depinfo;
+    use super::{artifact_candidates, inspect_restored_depinfo, resolve_artifact};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn artifact_candidates_unix_is_single_unchanged() {
+        // Empty suffix (Unix): the path as written is the only candidate.
+        assert_eq!(
+            artifact_candidates(Path::new("/proj/target/release/foo"), ""),
+            vec![PathBuf::from("/proj/target/release/foo")]
+        );
+    }
+
+    #[test]
+    fn artifact_candidates_appends_windows_exe_suffix() {
+        // Windows: try the suffix-less path, then `foo.exe`.
+        assert_eq!(
+            artifact_candidates(Path::new("/proj/target/release/foo"), ".exe"),
+            vec![
+                PathBuf::from("/proj/target/release/foo"),
+                PathBuf::from("/proj/target/release/foo.exe"),
+            ]
+        );
+    }
+
+    #[test]
+    fn artifact_candidates_does_not_double_suffix() {
+        // A fixture that already names `foo.exe` must not get `foo.exe.exe`.
+        assert_eq!(
+            artifact_candidates(Path::new("/proj/target/release/foo.exe"), ".exe"),
+            vec![PathBuf::from("/proj/target/release/foo.exe")]
+        );
+    }
+
+    #[test]
+    fn resolve_artifact_finds_existing_suffixless_binary() {
+        // The Unix shape: the exact path exists, no suffix needed.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("app");
+        std::fs::write(&bin, b"\x7fELF").unwrap();
+        assert_eq!(resolve_artifact(&bin).as_deref(), Some(bin.as_path()));
+    }
+
+    #[test]
+    fn resolve_artifact_missing_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_artifact(&dir.path().join("nope")).is_none());
+    }
 
     #[test]
     fn inspect_restored_depinfo_passes_on_absolute_paths() {

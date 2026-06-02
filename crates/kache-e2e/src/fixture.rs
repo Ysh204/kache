@@ -90,6 +90,11 @@ pub struct Fixture {
     #[serde(default)]
     pub requires: Vec<String>,
 
+    /// Overrides applied only when the harness runs on Windows (see
+    /// [`OsOverride`]). Parsed on every platform but consulted only there.
+    #[serde(default)]
+    pub windows: Option<OsOverride>,
+
     /// Absolute path to the fixture directory (set at load time, not
     /// in the toml).
     #[serde(skip)]
@@ -138,6 +143,35 @@ pub struct ModifySpec {
 pub struct Commands {
     pub build: String,
     pub clean: String,
+}
+
+/// Platform-specific overrides, applied when the harness runs on that
+/// platform. Each present field replaces its base counterpart; absent fields
+/// leave the base untouched. Currently only `[windows]` is consumed — e.g.
+/// `rust-c-ffi` must build with the `x86_64-pc-windows-gnu` target there
+/// (MinGW C objects can't link into an MSVC Rust binary), which changes the
+/// build command and the artifact output paths.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OsOverride {
+    /// Replaces `commands.build`.
+    #[serde(default)]
+    pub build: Option<String>,
+    /// Replaces `verify.run` (only when the fixture has a `[verify]`).
+    #[serde(default)]
+    pub run: Option<String>,
+    /// Replaces `diff.artifacts` (only when the fixture has a `[diff]`).
+    #[serde(default)]
+    pub artifacts: Option<Vec<String>>,
+    /// Merged into `[env]` (override-wins per key). Values ARE token-expanded
+    /// (`$KACHE` / `$KACHE_CC` / `$KACHE_CXX` / `$FALLBACK`), because the merge
+    /// happens before the expansion pass in [`Fixture::load`]. Used to retarget
+    /// a compiler on Windows, e.g. `rust-c-ffi` routes its build.rs C half
+    /// through the `$KACHE_CC` / `$KACHE_CXX` shims instead of `$KACHE cc`,
+    /// because cc-rs's `check_exe` mangles a multi-token `"<path>.exe cc"` CC
+    /// into bare `<path>.exe` on Windows (the `.exe` suffix makes
+    /// `set_extension` swallow the ` cc` arg), dropping the subcommand.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// How to verify the compiled artifact actually works.
@@ -289,20 +323,64 @@ pub struct NoopAssertions {
     pub recompile_marker: Option<String>,
 }
 
-/// Result of expanding `$KACHE` inside an env value.
+/// Expand the harness tokens inside an env value.
 ///
-/// Returned as a borrowed `Cow`-equivalent shape so values without
-/// `$KACHE` skip allocation.
-fn expand_kache(value: &str, kache_path: &Path) -> String {
-    // Bounded substitution: only `$KACHE` is recognized (no `${VAR}`,
-    // no `~`, no `$OTHER`). Documented in module docs as intentional.
-    value.replace("$KACHE", &kache_path.display().to_string())
+/// Two tokens are recognized (no `${VAR}`, no `~`, no `$OTHER` — intentional,
+/// see module docs): `$KACHE` → the kache binary under test, and `$FALLBACK` →
+/// the cross-platform `e2e-fallback` wrapper (used as `KACHE_FALLBACK`). Neither
+/// token is a substring of the other, so replace order is irrelevant.
+fn expand_tokens(value: &str, kache_path: &Path, fallback_path: &Path) -> String {
+    // The `kache-cc` / `kache-cxx` shims are built into the same dir as the
+    // real `kache` (cargo puts all bins under `target/<profile>/`), so derive
+    // their paths from `kache_path`'s parent. `$KACHE_CC` / `$KACHE_CXX` MUST
+    // be replaced before `$KACHE`, else the longer token's `$KACHE` prefix
+    // would be substituted first and leave a dangling `_CC`.
+    let sibling = |stem: &str| -> String {
+        kache_path
+            .parent()
+            .map(|dir| {
+                crate::portable_path(&dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX)))
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
+    value
+        .replace("$KACHE_CXX", &sibling("kache-cxx"))
+        .replace("$KACHE_CC", &sibling("kache-cc"))
+        .replace("$KACHE", &kache_path.display().to_string())
+        .replace("$FALLBACK", &fallback_path.display().to_string())
 }
 
 impl Fixture {
-    /// Load a fixture from `<dir>/kache-fixture.toml`, expanding `$KACHE`
-    /// in env values against `kache_path`.
-    pub fn load(dir: &Path, kache_path: &Path) -> Result<Self> {
+    /// Replace base fields with the `[windows]` overrides (build command, the
+    /// verify run path, and the diff artifact paths). Each is applied only when
+    /// both the override and its target section are present. Clone the override
+    /// out first so we don't borrow `self` immutably and mutably at once.
+    fn apply_windows_overrides(&mut self) {
+        let Some(ov) = self.windows.clone() else {
+            return;
+        };
+        if let Some(build) = ov.build {
+            self.commands.build = build;
+        }
+        if let (Some(run), Some(verify)) = (ov.run, self.verify.as_mut()) {
+            verify.run = run;
+        }
+        if let (Some(artifacts), Some(diff)) = (ov.artifacts, self.diff.as_mut()) {
+            diff.artifacts = artifacts;
+        }
+        // Merge env overrides last (override-wins). `load` runs this BEFORE
+        // its token-expansion pass, so these values get `$KACHE`/`$KACHE_CC`/
+        // … expanded just like the base env.
+        for (key, value) in ov.env {
+            self.env.insert(key, value);
+        }
+    }
+
+    /// Load a fixture from `<dir>/kache-fixture.toml`, expanding `$KACHE` and
+    /// `$FALLBACK` in env values against the binaries under test.
+    pub fn load(dir: &Path, kache_path: &Path, fallback_path: &Path) -> Result<Self> {
         let toml_path = dir.join("kache-fixture.toml");
         let raw = std::fs::read_to_string(&toml_path)
             .with_context(|| format!("reading {}", toml_path.display()))?;
@@ -324,10 +402,20 @@ impl Fixture {
             ));
         }
 
-        // Expand $KACHE in env values up-front; runners receive a
-        // pre-resolved env map and don't need to know about kache_path.
+        // Apply platform overrides BEFORE token expansion so the
+        // `[windows].env` values (which may use `$KACHE_CC` etc.) are
+        // expanded too. Runtime `cfg!` (not `#[cfg]`) so the `windows` field
+        // counts as read on every platform — the table is parsed everywhere
+        // but only consulted on its target OS.
+        if cfg!(windows) {
+            fixture.apply_windows_overrides();
+        }
+
+        // Expand $KACHE / $FALLBACK / $KACHE_CC / $KACHE_CXX in env values;
+        // runners receive a pre-resolved env map and don't need to know about
+        // the binary paths.
         for value in fixture.env.values_mut() {
-            *value = expand_kache(value, kache_path);
+            *value = expand_tokens(value, kache_path, fallback_path);
         }
 
         // Normalize so the dir is safe as a `cp -R <dir>/.` source (MSYS
@@ -347,7 +435,11 @@ impl Fixture {
 /// without a `kache-fixture.toml` are silently skipped — that's intentional,
 /// it lets `test-projects/` host both harness-driven and exploratory
 /// projects without the latter blowing up the runner.
-pub fn discover(root: &Path, kache_path: &Path) -> Result<IndexMap<String, Fixture>> {
+pub fn discover(
+    root: &Path,
+    kache_path: &Path,
+    fallback_path: &Path,
+) -> Result<IndexMap<String, Fixture>> {
     let mut out: Vec<Fixture> = Vec::new();
     let entries = std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))?;
     for entry in entries {
@@ -359,7 +451,7 @@ pub fn discover(root: &Path, kache_path: &Path) -> Result<IndexMap<String, Fixtu
         if !path.join("kache-fixture.toml").exists() {
             continue;
         }
-        out.push(Fixture::load(&path, kache_path)?);
+        out.push(Fixture::load(&path, kache_path, fallback_path)?);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -375,18 +467,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expand_kache_substitutes_path() {
-        let path = Path::new("/usr/local/bin/kache");
-        assert_eq!(expand_kache("$KACHE cc", path), "/usr/local/bin/kache cc");
-        assert_eq!(expand_kache("$KACHE", path), "/usr/local/bin/kache");
+    fn expand_tokens_substitutes_paths() {
+        let kache = Path::new("/usr/local/bin/kache");
+        let fb = Path::new("/tmp/e2e-fallback");
+        assert_eq!(
+            expand_tokens("$KACHE cc", kache, fb),
+            "/usr/local/bin/kache cc"
+        );
+        assert_eq!(expand_tokens("$KACHE", kache, fb), "/usr/local/bin/kache");
+        assert_eq!(expand_tokens("$FALLBACK", kache, fb), "/tmp/e2e-fallback");
     }
 
     #[test]
-    fn expand_kache_leaves_other_dollar_refs_alone() {
-        // Documents the deliberate restriction: only $KACHE is special.
-        // If a fixture wants HOME or PATH, it must declare it explicitly.
-        let path = Path::new("/k");
-        assert_eq!(expand_kache("$HOME/.cache", path), "$HOME/.cache");
-        assert_eq!(expand_kache("${KACHE}", path), "${KACHE}");
+    fn expand_tokens_substitutes_compiler_shims_before_kache() {
+        // $KACHE_CC / $KACHE_CXX resolve to siblings of $KACHE and MUST be
+        // replaced before $KACHE — otherwise "$KACHE_CC" would become
+        // "<kache>_CC". Suffix-aware so it holds on Windows too.
+        let kache = Path::new("/opt/k/kache");
+        let fb = Path::new("/tmp/e2e-fallback");
+        let sfx = std::env::consts::EXE_SUFFIX;
+        assert_eq!(
+            expand_tokens("$KACHE_CC", kache, fb),
+            format!("/opt/k/kache-cc{sfx}")
+        );
+        assert_eq!(
+            expand_tokens("$KACHE_CXX", kache, fb),
+            format!("/opt/k/kache-cxx{sfx}")
+        );
+        assert_eq!(expand_tokens("$KACHE", kache, fb), "/opt/k/kache");
+    }
+
+    #[test]
+    fn expand_tokens_leaves_other_dollar_refs_alone() {
+        // Documents the deliberate restriction: only $KACHE / $FALLBACK are
+        // special. If a fixture wants HOME or PATH, it must declare it explicitly.
+        let k = Path::new("/k");
+        let fb = Path::new("/fb");
+        assert_eq!(expand_tokens("$HOME/.cache", k, fb), "$HOME/.cache");
+        assert_eq!(expand_tokens("${KACHE}", k, fb), "${KACHE}");
     }
 }
