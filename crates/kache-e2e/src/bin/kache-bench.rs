@@ -149,10 +149,16 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let kache = args
-        .kache
-        .canonicalize()
-        .with_context(|| format!("kache binary not found at {}", args.kache.display()))?;
+    let kache_path = resolve_binary(&args.kache);
+    let kache = de_verbatim(
+        kache_path
+            .canonicalize()
+            .with_context(|| format!("kache binary not found at {}", kache_path.display()))?,
+    );
+
+    // Resolve a POSIX shell up front so a Windows host missing Git bash fails
+    // before the (expensive) clone, not midway through setup.
+    let sh = posix_sh()?;
 
     // Load the project profile (which repo, how to wire kache in, how to
     // build). Everything below this is the project-agnostic measurement
@@ -177,7 +183,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| default_work_dir(&profile.name));
     std::fs::create_dir_all(&work_dir_arg)
         .with_context(|| format!("creating work dir {}", work_dir_arg.display()))?;
-    let work_dir = work_dir_arg.canonicalize()?;
+    let work_dir = de_verbatim(work_dir_arg.canonicalize()?);
     // Hold an exclusive lock on the work dir for the whole run so a second
     // bench can't share this scratch dir and clobber it. Bound (not `_`) so it
     // lives to the end of `main`; released automatically on process exit.
@@ -241,7 +247,7 @@ fn main() -> Result<()> {
             &clone_a,
             &clone_b,
         )?;
-        run_setup(&profile, &clone_a, &kache, args.force_setup)?;
+        run_setup(&profile, &clone_a, &kache, args.force_setup, &sh)?;
     }
 
     // Wire kache into each worktree (mozconfig write, .cargo/config append,
@@ -267,6 +273,7 @@ fn main() -> Result<()> {
             &work_dir,
             &event_log,
             args.trace_keys,
+            &sh,
         )?
     };
 
@@ -289,6 +296,7 @@ fn main() -> Result<()> {
         &kache,
         &work_dir,
         args.trace_keys,
+        &sh,
     )?;
     daemon_stop(&kache, &cache_dir);
     let (warm, warm_raw) = capture_report(&kache, &cache_dir, &work_dir, "warm")?;
@@ -462,7 +470,16 @@ fn clone_worktrees(
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         run(Command::new("git")
-            .args(["clone", "--depth", "1", "--branch"])
+            // core.longpaths: polkadot-sdk / Firefox have paths > 260 chars,
+            // so a Windows clone fails without it. Harmless no-op on Unix.
+            .args([
+                "-c",
+                "core.longpaths=true",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+            ])
             .arg(tag)
             .arg(repo)
             .arg(clone_ref))?;
@@ -497,6 +514,7 @@ fn clone_worktrees(
     for d in [clone_a, clone_b] {
         eprintln!("[bench] creating worktree {}", d.display());
         run(Command::new("git")
+            .args(["-c", "core.longpaths=true"])
             .arg("-C")
             .arg(clone_ref)
             .args(["worktree", "add", "--detach"])
@@ -553,11 +571,101 @@ fn reset_worktree_path(clone_ref: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Return `path` if it exists; else `path` with a `.exe` extension if THAT
+/// exists; else `path` unchanged (so the caller's not-found error names the
+/// path the user gave). Lets a Unix-style `./target/release/kache` resolve to
+/// `kache.exe` on Windows. No-op on Unix where the bare path exists.
+/// Strip Windows' `\\?\` verbatim / extended-length prefix that
+/// `Path::canonicalize` adds — `git` and many tools reject verbatim paths, so
+/// every path derived from a canonicalized `work_dir` (clone-ref, worktrees,
+/// cache) must be plain. No-op on Unix and for already-plain paths.
+fn de_verbatim(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    p
+}
+
+fn resolve_binary(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    let exe = path.with_extension("exe");
+    if exe.exists() {
+        return exe;
+    }
+    path.to_path_buf()
+}
+
+/// Resolve a POSIX `sh` to run profile setup/build snippets. Unix: `sh`
+/// (always on PATH; `Command` resolves it). Windows: Git for Windows'
+/// `sh.exe` — PATH, then derived from `git --exec-path`, then well-known
+/// install roots — with a clear error if none is found.
+fn posix_sh() -> Result<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from("sh"))
+    }
+    #[cfg(windows)]
+    {
+        find_windows_sh().context(
+            "no POSIX `sh` found — install Git for Windows (provides \
+             usr\\bin\\sh.exe) or put a POSIX sh on PATH",
+        )
+    }
+}
+
+#[cfg(windows)]
+fn find_windows_sh() -> Option<PathBuf> {
+    // 1. sh.exe already on PATH.
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join("sh.exe");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    // 2. Derive from `git --exec-path` (…\Git\mingw64\libexec\git-core).
+    if let Ok(out) = Command::new("git").arg("--exec-path").output()
+        && out.status.success()
+    {
+        let exec = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        for anc in exec.ancestors() {
+            let cand = anc.join("usr").join("bin").join("sh.exe");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    // 3. Well-known install roots.
+    for root in [r"C:\Program Files\Git", r"C:\Program Files (x86)\Git"] {
+        let cand = Path::new(root).join(r"usr\bin\sh.exe");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 /// Run the profile's one-time `setup` steps (e.g. `./mach bootstrap`,
 /// `rustup target add`) in `clone`. Skipped when the profile's
 /// `setup_marker` already exists unless `force` is set. Each step runs
 /// via `sh -c` with the kache env available for interpolation.
-fn run_setup(profile: &BenchProfile, clone: &Path, kache: &Path, force: bool) -> Result<()> {
+fn run_setup(
+    profile: &BenchProfile,
+    clone: &Path,
+    kache: &Path,
+    force: bool,
+    sh: &Path,
+) -> Result<()> {
     let steps = profile.setup_commands(kache);
     if steps.is_empty() {
         return Ok(());
@@ -571,7 +679,7 @@ fn run_setup(profile: &BenchProfile, clone: &Path, kache: &Path, force: bool) ->
     }
     for step in &steps {
         eprintln!("\n[bench] setup: {step}");
-        run(Command::new("sh").arg("-c").arg(step).current_dir(clone))?;
+        run(Command::new(sh).arg("-c").arg(step).current_dir(clone))?;
     }
     Ok(())
 }
@@ -601,6 +709,7 @@ fn build(
     kache: &Path,
     work_dir: &Path,
     trace_keys: bool,
+    sh: &Path,
 ) -> Result<u64> {
     let log_path = work_dir.join(format!("build-{phase}.log"));
     let wrapper_log_path = work_dir.join(format!("wrapper-{phase}.log"));
@@ -626,7 +735,7 @@ fn build(
             .with_context(|| format!("wiping objdir {}", objdir.display()))?;
     }
     let started = Instant::now();
-    let mut child = Command::new("sh")
+    let mut child = Command::new(sh)
         .arg("-c")
         .arg(&build_cmd)
         .current_dir(clone)
@@ -733,6 +842,7 @@ fn run_cold_phase(
     work_dir: &Path,
     event_log: &Path,
     trace_keys: bool,
+    sh: &Path,
 ) -> Result<(PhaseMetrics, serde_json::Value)> {
     daemon_stop(kache, cache_dir);
     if cache_dir.exists() {
@@ -748,6 +858,7 @@ fn run_cold_phase(
         kache,
         work_dir,
         trace_keys,
+        sh,
     )?;
     daemon_stop(kache, cache_dir);
     let (cold, cold_raw) = capture_report(kache, cache_dir, work_dir, "cold")?;
@@ -1199,49 +1310,87 @@ fn run(cmd: &mut Command) -> Result<()> {
 }
 
 /// Apparent size of `dir` in KiB via `du -sk`. Returns 0 if `du` is
-/// unavailable or fails — the cache size is a reported metric, not a
-/// load-bearing one.
+/// Apparent size of `dir` in KiB — the sum of file lengths, recursive, never
+/// following symlinks. Returns 0 on any error (a reported metric, not
+/// load-bearing). Cross-platform (no `du`).
 fn dir_size_kb(dir: &Path) -> u64 {
-    Command::new("du")
-        .arg("-sk")
-        .arg(dir)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .next()
-                .and_then(|kb| kb.parse().ok())
-        })
-        .unwrap_or(0)
+    fn walk(dir: &Path, acc: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(md) = path.symlink_metadata() else {
+                continue;
+            };
+            if md.file_type().is_symlink() {
+                continue;
+            }
+            if md.is_dir() {
+                walk(&path, acc);
+            } else {
+                *acc += md.len();
+            }
+        }
+    }
+    let mut bytes = 0u64;
+    walk(dir, &mut bytes);
+    bytes / 1024
 }
 
-/// Clone a directory tree via the filesystem's CoW reflink mechanism
-/// when supported (APFS / btrfs / XFS-reflink); fall back to a plain
-/// recursive copy. Used to snapshot the cache after the cold phase so a
-/// later `--retry` can restore exactly that state without re-running.
+/// Snapshot `src` → `dst` so a later `--retry` can restore the post-cold
+/// cache. Unix fast path: CoW reflink via `cp` (APFS clonefile / btrfs/XFS
+/// FICLONE) — matters for the multi-GB cache. Portable fallback (and the sole
+/// Windows path): a plain recursive copy.
 fn snapshot_dir(src: &Path, dst: &Path) -> Result<()> {
-    let try_cp = |args: &[&str]| -> bool {
+    if dst.exists() {
+        let _ = std::fs::remove_dir_all(dst);
+    }
+    #[cfg(unix)]
+    {
+        let try_cp = |args: &[&str]| -> bool {
+            if dst.exists() {
+                let _ = std::fs::remove_dir_all(dst);
+            }
+            Command::new("cp")
+                .args(args)
+                .arg(src)
+                .arg(dst)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        // BSD cp (macOS APFS) → clonefile. GNU cp (Linux btrfs / XFS) →
+        // FICLONE. Plain `-R` is the slow-but-portable fallback.
+        if try_cp(&["-cR"]) || try_cp(&["-R", "--reflink=auto"]) || try_cp(&["-R"]) {
+            return Ok(());
+        }
+        // A failed cp may have left a partial tree; clear it first.
         if dst.exists() {
             let _ = std::fs::remove_dir_all(dst);
         }
-        Command::new("cp")
-            .args(args)
-            .arg(src)
-            .arg(dst)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
-    // BSD cp (macOS APFS) → clonefile. GNU cp (Linux btrfs / XFS) →
-    // FICLONE. Plain `-R` is the slow-but-portable fallback.
-    if try_cp(&["-cR"]) || try_cp(&["-R", "--reflink=auto"]) || try_cp(&["-R"]) {
-        return Ok(());
     }
-    bail!("failed to snapshot {} -> {}", src.display(), dst.display())
+    copy_dir_recursive(src, dst)
+        .with_context(|| format!("snapshotting {} -> {}", src.display(), dst.display()))
+}
+
+/// Recursively copy `src` into `dst` (creating `dst`) with plain byte copies —
+/// no reflink. Cross-platform.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Deserialize a JSON file into `T`.
@@ -1322,7 +1471,7 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
     eprintln!("{bar}");
 
     // ── disk layout: the three pools and what sharing buys ──
-    // Apparent = sum of inode-reported sizes (matches `du`). On APFS,
+    // Apparent = sum of file lengths (matches `du --apparent-size`). On APFS,
     // bytes that kache reflinked from the cache into the warm clone
     // appear in both inodes' apparent sizes but only occupy disk once.
     // Subtracting `warm reflinked_bytes` from the apparent sum gives a
@@ -1671,6 +1820,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolve_binary_prefers_existing_then_exe() {
+        let dir = std::env::temp_dir().join(format!("kb-resolvebin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only `foo.exe` exists → resolve_binary(dir/foo) returns dir/foo.exe.
+        std::fs::write(dir.join("foo.exe"), b"x").unwrap();
+        assert_eq!(resolve_binary(&dir.join("foo")), dir.join("foo.exe"));
+        // A path that exists as-is is returned unchanged.
+        std::fs::write(dir.join("bar"), b"x").unwrap();
+        assert_eq!(resolve_binary(&dir.join("bar")), dir.join("bar"));
+        // Nothing exists → returned unchanged (so the caller's error names it).
+        assert_eq!(resolve_binary(&dir.join("nope")), dir.join("nope"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn posix_sh_resolves_a_shell() {
+        let sh = posix_sh().expect("a POSIX sh should be resolvable on the test host");
+        let name = sh.file_name().unwrap().to_string_lossy().to_lowercase();
+        // Unix: `sh`; Windows CI: `sh.exe`.
+        assert!(name.starts_with("sh"), "unexpected shell: {}", sh.display());
+    }
+
+    #[test]
+    fn de_verbatim_strips_windows_extended_prefix() {
+        // Plain paths are untouched on every platform.
+        assert_eq!(
+            de_verbatim(PathBuf::from("/tmp/x")),
+            PathBuf::from("/tmp/x")
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                de_verbatim(PathBuf::from(r"\\?\C:\a\b")),
+                PathBuf::from(r"C:\a\b")
+            );
+            assert_eq!(
+                de_verbatim(PathBuf::from(r"\\?\UNC\srv\share")),
+                PathBuf::from(r"\\srv\share")
+            );
+        }
+    }
+
+    #[test]
     fn parse_key_line_extracts_crate_and_payload_from_default_tracing_format() {
         let line = "2026-05-24T16:45:23.123Z TRACE kache::cache_key: \
                     [key:gkrust] env_dep:CARGO_MANIFEST_DIR=/abs/path";
@@ -1835,5 +2027,35 @@ mod tests {
             .collect();
         assert!(fields.contains(&"env_dep:CARGO_MANIFEST_DIR"));
         assert!(fields.contains(&"final"));
+    }
+
+    #[test]
+    fn dir_size_kb_sums_file_bytes_recursively() {
+        let dir = std::env::temp_dir().join(format!("kb-dirsize-{}", std::process::id()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 1024]).unwrap(); // 1 KiB
+        std::fs::write(sub.join("b.bin"), vec![0u8; 2048]).unwrap(); // 2 KiB
+        assert_eq!(dir_size_kb(&dir), 3); // (1024 + 2048) / 1024
+        // Missing dir → 0 (graceful).
+        assert_eq!(dir_size_kb(&dir.join("does-not-exist")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_dir_recursive_round_trips_a_tree() {
+        let base = std::env::temp_dir().join(format!("kb-copytree-{}", std::process::id()));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("top.txt"), b"top").unwrap();
+        std::fs::write(src.join("nested").join("deep.txt"), b"deep").unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join("top.txt")).unwrap(), b"top");
+        assert_eq!(
+            std::fs::read(dst.join("nested").join("deep.txt")).unwrap(),
+            b"deep"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
