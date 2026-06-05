@@ -104,6 +104,43 @@ export KACHE_KEY_SALT="$(nix eval --raw .#devShells.default.outPath | sha256sum 
 
 The salt is hashed raw; its meaning is entirely yours. An unset or empty value has **no effect** — keys are byte-identical to not setting it — so it is safe to leave off until you need it. A misconfigured salt can only cost hit rate (an extra miss), never cause a wrong artifact to be restored.
 
+## Extra cache-key inputs
+
+kache keys a crate on what the compiler reports — source files, `--extern` dependencies, flags. Some crates also read files **at compile time that the compiler never reports**, so kache can't see them change:
+
+- sqlx's `query!` macro reads `.sqlx/query-*.json` (the offline query cache)
+- migration macros read `migrations/`
+- codegen / macros that `include!` data files by a path rustc doesn't surface
+
+Edit one of those and the `.rs` files are unchanged, so the key doesn't move — and kache would restore the previously-compiled artifact (a stale hit). Declare those files so a change to them re-keys the crate.
+
+Add a `kache.toml` next to the crate's `Cargo.toml`:
+
+```toml title="my-app/db/kache.toml"
+extra_inputs = [
+  ".sqlx/**/*.json",
+  "migrations/**/*.sql",
+]
+```
+
+Globs are relative to the crate directory. A bare directory is fine — `.sqlx` and `.sqlx/` both mean "everything under it." The matched files' contents are folded into that crate's key.
+
+A pattern **may** reach outside the crate with `..` or an absolute path when a build genuinely depends on a shared tree above the crates or a machine-specific file. That's allowed and stays fail-safe, but it makes the crate's key host- or layout-specific (kache logs a warning), so it no longer shares across machines or worktrees — prefer a co-located input where you can.
+
+This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffected, and one crate's `extra_inputs` never *implicitly* touch a sibling crate's key. It is also **union-only** — a misdeclared glob can only cause an extra cache *miss* (a rebuild), never restore a wrong artifact. Each file is folded as its crate-relative path plus content hash, so moving the worktree doesn't bust the cache, but swapping two matched files' contents (where order matters, like sqlx migrations) does re-key. The declared patterns are folded too, so editing `kache.toml` itself re-keys — even when it currently matches nothing.
+
+<Callout type="warn">
+  Keep patterns narrow. A glob that walks a huge tree (an absolute `/**`, or a
+  `**/*` that accidentally spans `target/`) re-keys on every change and re-walks
+  the tree on every compile — kache warns when a pattern matches the filesystem
+  root or an unusually large number of files.
+</Callout>
+
+<Callout type="info">
+  `kache.toml` (no leading dot) is **only** for `extra_inputs`. It is distinct
+  from the project config `.kache.toml`; any other key in it is a loud error.
+</Callout>
+
 ## Credential resolution order
 
 Remote S3 credentials are resolved in this order:
