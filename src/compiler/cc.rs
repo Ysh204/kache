@@ -41,11 +41,53 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use super::flags::{FlagClass, FlagSpec, Matcher};
+use super::flags::{Dialect, FlagClass, FlagSpec, Matcher};
 use super::{
     ArtifactKind, ArtifactSet, CompileResult, Compiler, CompilerAdapter, CompilerId, KeyCtx,
     RefuseReason, classify_by_filename,
 };
+
+/// Compiler driver family of a cc-wrapper invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolFamily {
+    /// gcc / cc and compatible drivers.
+    Gnu,
+    /// clang / clang++ in the default (gcc-compatible) driver mode.
+    Clang,
+    /// clang in MSVC driver mode (`clang-cl` or `--driver-mode=cl`).
+    ClangCl,
+}
+
+impl ToolFamily {
+    /// The flag dialect this family speaks (Gnu and Clang share one).
+    pub fn dialect(self) -> Dialect {
+        match self {
+            ToolFamily::Gnu | ToolFamily::Clang => Dialect::Gnu,
+            ToolFamily::ClangCl => Dialect::Cl,
+        }
+    }
+
+    /// Detect the family from argv0 and the argument list.
+    ///
+    /// `clang-cl` (basename) or any argv carrying `--driver-mode=cl` is
+    /// `ClangCl`. A `clang`/`clang++`/`clang-<n>` basename is `Clang`.
+    /// Everything else (gcc, cc, g++, c++) is `Gnu`. Bare `cl` is NOT
+    /// special-cased — real MSVC `cl.exe` stays out of scope.
+    pub fn detect(program: &str, rest: &[String]) -> ToolFamily {
+        let name = super::command_basename(program)
+            .map(super::strip_windows_exe_suffix)
+            .unwrap_or(program)
+            .to_ascii_lowercase();
+        if name == "clang-cl" || rest.iter().any(|a| a == "--driver-mode=cl") {
+            return ToolFamily::ClangCl;
+        }
+        let stem = name.split('-').next().unwrap_or("");
+        if stem == "clang" || stem == "clang++" {
+            return ToolFamily::Clang;
+        }
+        ToolFamily::Gnu
+    }
+}
 
 pub const CC_ID: CompilerId = CompilerId::new("cc");
 pub const ADAPTER: CompilerAdapter =
@@ -164,6 +206,8 @@ pub struct CcArgs {
     /// Language override from `-x c` / `-x c++` / `-x objective-c`.
     /// Without this flag, the compiler infers from source extension.
     pub language_override: Option<String>,
+    /// Detected compiler driver family (selects the flag dialect).
+    pub family: ToolFamily,
 }
 
 /// Source file extensions the parser recognizes as C-family input.
@@ -223,6 +267,8 @@ struct CcArgSpec {
     action: CcArgAction,
     bucket: CcArgBucket,
     source: &'static str,
+    /// Dialect this row applies to. `None` = any dialect.
+    dialect: Option<Dialect>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +295,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetMode(CompileMode::Compile),
         bucket: CcArgBucket::Structural,
         source: "compile mode marker",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-E"),
@@ -256,6 +303,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetMode(CompileMode::Preprocess),
         bucket: CcArgBucket::Structural,
         source: "preprocess mode marker",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-S"),
@@ -263,6 +311,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetMode(CompileMode::Assemble),
         bucket: CcArgBucket::Structural,
         source: "assembly mode marker",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-o"),
@@ -270,6 +319,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOutput,
         bucket: CcArgBucket::Artifact,
         source: "primary output path",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-fPIC"),
@@ -277,6 +327,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetPic,
         bucket: CcArgBucket::ModeledInKey,
         source: "position-independent code",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-fpic"),
@@ -284,6 +335,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetPic,
         bucket: CcArgBucket::ModeledInKey,
         source: "position-independent code",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g"),
@@ -291,6 +343,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(2),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g0"),
@@ -298,6 +351,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(0),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g1"),
@@ -305,6 +359,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(1),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g2"),
@@ -312,6 +367,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(2),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-g3"),
@@ -319,6 +375,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetDebugLevel(3),
         bucket: CcArgBucket::ModeledInKey,
         source: "debug-info level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O"),
@@ -326,6 +383,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O1),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O0"),
@@ -333,6 +391,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O0),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O1"),
@@ -340,6 +399,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O1),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O2"),
@@ -347,6 +407,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O2),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-O3"),
@@ -354,6 +415,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::O3),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-Os"),
@@ -361,6 +423,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::Os),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-Oz"),
@@ -368,6 +431,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::Oz),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Exact("-Og"),
@@ -375,13 +439,21 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetOptimization(OptLevel::Og),
         bucket: CcArgBucket::ModeledInKey,
         source: "optimization level",
+        dialect: None,
     },
+    // ── GNU dep-info rows — gnu dialect only ─────────────────────
+    // In clang-cl mode, `-MD`/`-MMD` are CRT-selection flags (matching
+    // MSVC `/MD`/`/MDd`), `-MT`/`-MF`/`-MQ` are also CRT/output
+    // spellings, and `-MP`/`-MG` are unrelated. Tagging these rows
+    // `Dialect::Gnu` makes the parser skip them entirely under clang-cl
+    // so they fall through to the flag classifier / unknown-flag path.
     CcArgSpec {
         matcher: Matcher::Exact("-MD"),
         value_form: CcArgValueForm::Flag,
         action: CcArgAction::DepIncludeSystem(true),
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency sidecar",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MMD"),
@@ -389,6 +461,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepIncludeSystem(false),
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency sidecar",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MP"),
@@ -396,6 +469,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepPhonyTargets,
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency sidecar phony targets",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MG"),
@@ -403,6 +477,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepMissingGenerated,
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency sidecar generated headers",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MF"),
@@ -410,6 +485,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepOutput,
         bucket: CcArgBucket::Artifact,
         source: "dependency output path",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MT"),
@@ -417,6 +493,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepTarget,
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency target",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Exact("-MQ"),
@@ -424,6 +501,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::DepTarget,
         bucket: CcArgBucket::NoObjectEffect,
         source: "dependency target",
+        dialect: Some(Dialect::Gnu),
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-x"),
@@ -431,6 +509,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::LanguageOverride,
         bucket: CcArgBucket::ProbeKeyed,
         source: "language override",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-I"),
@@ -438,6 +517,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::Include,
         bucket: CcArgBucket::Preprocessor,
         source: "include search path",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-D"),
@@ -445,6 +525,7 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::Define,
         bucket: CcArgBucket::Preprocessor,
         source: "preprocessor define",
+        dialect: None,
     },
     CcArgSpec {
         matcher: Matcher::Prefix("-std="),
@@ -452,6 +533,44 @@ static CC_ARG_SPECS: &[CcArgSpec] = &[
         action: CcArgAction::SetStd,
         bucket: CcArgBucket::ModeledInKey,
         source: "language standard",
+        dialect: None,
+    },
+    // ── clang-cl output and standard rows (#285) ─────────────────
+    // clang-cl uses `-Fo<obj>` / `/Fo<obj>` (concatenated, no space)
+    // for the object output path, analogous to gnu `-o <obj>`.
+    CcArgSpec {
+        matcher: Matcher::Prefix("-Fo"),
+        value_form: CcArgValueForm::Concatenated { prefix: "-Fo" },
+        action: CcArgAction::SetOutput,
+        bucket: CcArgBucket::Artifact,
+        source: "clang-cl object output (#285)",
+        dialect: Some(Dialect::Cl),
+    },
+    CcArgSpec {
+        matcher: Matcher::Prefix("/Fo"),
+        value_form: CcArgValueForm::Concatenated { prefix: "/Fo" },
+        action: CcArgAction::SetOutput,
+        bucket: CcArgBucket::Artifact,
+        source: "clang-cl object output (#285)",
+        dialect: Some(Dialect::Cl),
+    },
+    // clang-cl language standard: `-std:c++20` / `/std:c++20`.
+    // The value after the prefix (e.g. `c++20`) is stored in `parsed.std`.
+    CcArgSpec {
+        matcher: Matcher::Prefix("-std:"),
+        value_form: CcArgValueForm::Concatenated { prefix: "-std:" },
+        action: CcArgAction::SetStd,
+        bucket: CcArgBucket::ModeledInKey,
+        source: "clang-cl language standard (#285)",
+        dialect: Some(Dialect::Cl),
+    },
+    CcArgSpec {
+        matcher: Matcher::Prefix("/std:"),
+        value_form: CcArgValueForm::Concatenated { prefix: "/std:" },
+        action: CcArgAction::SetStd,
+        bucket: CcArgBucket::ModeledInKey,
+        source: "clang-cl language standard (#285)",
+        dialect: Some(Dialect::Cl),
     },
 ];
 
@@ -460,6 +579,8 @@ impl CcArgs {
         let (program, rest) = args
             .split_first()
             .context("cc invocation missing argv[0]")?;
+
+        let family = ToolFamily::detect(program, rest);
 
         let mut parsed = CcArgs {
             program: program.clone(),
@@ -475,6 +596,7 @@ impl CcArgs {
             pic: false,
             depinfo: None,
             language_override: None,
+            family,
         };
 
         // Walk argv through a table-driven parser so spelling variants
@@ -482,7 +604,7 @@ impl CcArgs {
         let mut depinfo: Option<DepInfoSpec> = None;
         let mut idx = 0;
         while idx < rest.len() {
-            if let Some(arg) = parse_cc_arg_at(rest, idx) {
+            if let Some(arg) = parse_cc_arg_at(rest, idx, family.dialect()) {
                 apply_cc_arg(&mut parsed, &mut depinfo, &arg);
                 idx += arg.consumed;
                 continue;
@@ -569,6 +691,28 @@ impl CcArgs {
             CompileMode::Assemble => reasons.push(RefuseReason::Unsupported(
                 "cc: assembly mode -S (not yet supported)",
             )),
+        }
+
+        // clang-cl debug info embeds absolute CodeView /
+        // -fdebug-compilation-dir paths the preprocessor hash doesn't
+        // capture, and clang-cl ignores -ffile-prefix-map — a cached
+        // object would carry another checkout's paths. Refuse until
+        // Layer 3 lands a cl path-remap (#285). Catches both the `-g`
+        // form (parsed into debug_level) and the native MSVC `/Z7`/`/Zi`
+        // spellings (not yet modeled — refuse explicitly so this guard,
+        // not the incidental unsupported-flag path, owns the contract).
+        let cl_native_debug = self.rest.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "/Z7" | "/Zi" | "/ZI" | "/Zd" | "-Z7" | "-Zi" | "-ZI" | "-Zd"
+            )
+        });
+        if self.family.dialect() == Dialect::Cl
+            && (self.debug_level.is_some_and(|d| d > 0) || cl_native_debug)
+        {
+            reasons.push(RefuseReason::Unsupported(
+                "cc: clang-cl debug info embeds non-portable paths (not yet supported)",
+            ));
         }
 
         // Output to stdout — `-o -` is unambiguous; an `-o` followed
@@ -726,17 +870,22 @@ impl CcArgs {
 
     /// The object file a `-c` compile produces.
     ///
-    /// `-o <path>` if explicit; otherwise the gcc/clang default —
-    /// the source file's stem with a `.o` extension, in the current
-    /// working directory. Returns `None` only for degenerate
-    /// invocations with no source (which `refuse_reasons` already
-    /// rejects, so callers on the cache path won't hit `None`).
+    /// `-o <path>` if explicit; otherwise the compiler default — the
+    /// source file's stem with a `.o` (gnu dialect) or `.obj` (cl
+    /// dialect) extension, in the current working directory. Returns
+    /// `None` only for degenerate invocations with no source (which
+    /// `refuse_reasons` already rejects, so callers on the cache path
+    /// won't hit `None`).
     pub fn object_output_path(&self) -> Option<PathBuf> {
         if let Some(o) = &self.output {
             return Some(o.clone());
         }
         let stem = self.sources.first()?.file_stem()?;
-        Some(PathBuf::from(format!("{}.o", stem.to_string_lossy())))
+        let ext = match self.family.dialect() {
+            Dialect::Cl => "obj",
+            Dialect::Gnu => "o",
+        };
+        Some(PathBuf::from(format!("{}.{ext}", stem.to_string_lossy())))
     }
 
     /// The dep-info file a compile produces when `-MD` / `-MMD` is active.
@@ -777,34 +926,54 @@ impl CcArgs {
 
     /// The subset of `rest` that identifies the *compile configuration*
     /// — per-translation-unit noise removed: source files, the `-o`
-    /// output path, and dependency-file flags (`-MF`/`-MT`/`-MQ`) with
-    /// their values. The resolved-invocation probe (`cc -###`) is
-    /// memoized on this, so every TU of a build that shares a flag set
-    /// reuses one probe record instead of re-resolving per file.
+    /// output path, and (under the Gnu dialect only) dependency-file
+    /// flags (`-MF`/`-MT`/`-MQ`) with their values. Under the Cl dialect
+    /// those `-M*` spellings are CRT selection (codegen), so they are
+    /// kept. The resolved-invocation probe (`cc -###`) is memoized on
+    /// this, so every TU of a build that shares a flag set reuses one
+    /// probe record instead of re-resolving per file.
     pub fn config_args(&self) -> Vec<String> {
         let mut out = Vec::new();
         let mut iter = self.rest.iter();
+        // Per-TU noise to drop from the probe-memo key. GnuDialect drops
+        // the dep-target flags (`-MT`/`-MF`/`-MQ`) and their values; the
+        // cl dialect must NOT — there `-MT`/`-MD` are CRT-selection
+        // codegen (CapturedByProbe) and stripping them from the memo key
+        // would collapse distinct CRTs into one record (false hit, #285).
+        let drops_value: &[&str] = match self.family.dialect() {
+            Dialect::Gnu => &["-o", "-MF", "-MT", "-MQ"],
+            Dialect::Cl => &["-o"],
+        };
         while let Some(arg) = iter.next() {
-            match arg.as_str() {
-                "-o" | "-MF" | "-MT" | "-MQ" => {
-                    iter.next(); // also drop the flag's value
-                }
-                _ if self
-                    .sources
-                    .iter()
-                    .any(|s| s.to_str() == Some(arg.as_str())) => {}
-                _ => out.push(arg.clone()),
+            if drops_value.contains(&arg.as_str()) {
+                iter.next(); // also drop the flag's value
+            } else if self.family.dialect() == Dialect::Cl
+                && (arg.starts_with("-Fo") || arg.starts_with("/Fo"))
+            {
+                // `-Fo<obj>` / `/Fo<obj>` — concatenated output token,
+                // per-TU noise. Strip it from the probe-memo key so the
+                // same config with different output paths reuses one probe
+                // record. The value is embedded in the token (no next-arg
+                // to consume).
+            } else if self
+                .sources
+                .iter()
+                .any(|s| s.to_str() == Some(arg.as_str()))
+            {
+                // source file — per-TU
+            } else {
+                out.push(arg.clone());
             }
         }
         out
     }
 }
 
-fn parse_cc_arg_at(args: &[String], idx: usize) -> Option<ParsedCcArg> {
+fn parse_cc_arg_at(args: &[String], idx: usize, dialect: Dialect) -> Option<ParsedCcArg> {
     let arg = args.get(idx)?;
     CC_ARG_SPECS
         .iter()
-        .find_map(|spec| parse_cc_arg_with_spec(spec, args, idx, arg))
+        .find_map(|spec| parse_cc_arg_with_spec(spec, args, idx, arg, dialect))
 }
 
 fn parse_cc_arg_with_spec(
@@ -812,7 +981,15 @@ fn parse_cc_arg_with_spec(
     args: &[String],
     idx: usize,
     arg: &str,
+    dialect: Dialect,
 ) -> Option<ParsedCcArg> {
+    // Skip rows that are restricted to a different dialect (mirrors the
+    // classifier's dialect filter in `flags::classify_against`).
+    if let Some(d) = spec.dialect
+        && d != dialect
+    {
+        return None;
+    }
     match spec.value_form {
         CcArgValueForm::Flag => cc_arg_spec_matches(spec, arg).then_some(ParsedCcArg {
             spec,
@@ -968,9 +1145,10 @@ fn cc_target_arch(parsed: &CcArgs) -> String {
         .unwrap_or_else(|| std::env::consts::ARCH.to_string())
 }
 
-/// Build the argv for a preprocess-only run: the original args with
-/// mode/output/dep-info flags stripped and `-E -P` forced.
+/// Build the argv for a preprocess-only run, dialect-dependent.
 ///
+/// **Gnu dialect** — the original args with mode/output/dep-info flags
+/// stripped and `-E -P` forced:
 /// - `-c` / `-S` removed — we force `-E` (preprocess only).
 /// - `-o <arg>` removed — preprocessed output must go to stdout, not
 ///   a file (we capture and hash it).
@@ -981,30 +1159,66 @@ fn cc_target_arch(parsed: &CcArgs) -> String {
 ///   (`# 1 "/abs/path/header.h"`), so the hash captures expanded
 ///   *content* without leaking machine-local header paths — that's
 ///   what makes the key portable across machines.
+///
+/// **Cl dialect** — `/EP` is the MSVC equivalent (preprocess to stdout,
+/// no line markers; gnu `-E -P` writes nothing to stdout under clang-cl).
+/// Only compile-mode (`-c`/`-S`) and output (`-o`, `-Fo`/`/Fo`) flags are
+/// stripped; the `-M*` spellings are CRT-selection codegen in this dialect
+/// (they affect `_MT`/`_DLL` defines), so they are KEPT in the expansion.
 fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
-    let mut out = vec!["-E".to_string(), "-P".to_string()];
-    let mut iter = parsed.rest.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-c" | "-S" => {}
-            "-o" | "-MF" | "-MT" | "-MQ" => {
-                iter.next(); // also drop the flag's value
+    match parsed.family.dialect() {
+        Dialect::Gnu => {
+            let mut out = vec!["-E".to_string(), "-P".to_string()];
+            let mut iter = parsed.rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "-c" | "-S" => {}
+                    "-o" | "-MF" | "-MT" | "-MQ" => {
+                        iter.next(); // also drop the flag's value
+                    }
+                    "-MMD" | "-MD" | "-MP" | "-MG" => {}
+                    _ => out.push(arg.clone()),
+                }
             }
-            "-MMD" | "-MD" | "-MP" | "-MG" => {}
-            _ => out.push(arg.clone()),
+            out
+        }
+        Dialect::Cl => {
+            // `/EP` = preprocess to stdout, no line markers (MSVC
+            // equivalent of gnu `-E -P`). Drop compile-mode + output
+            // flags; keep preprocessor-affecting flags so the hash
+            // reflects them.
+            let mut out = vec!["/EP".to_string()];
+            let mut iter = parsed.rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "-c" | "-S" => {}
+                    "-o" => {
+                        iter.next();
+                    }
+                    // Attached output form (`-Fofoo.obj` / `/Fofoo.obj`).
+                    // clang-cl build systems use the attached form
+                    // exclusively; a space-separated `/Fo obj` would leave
+                    // a stray token, but such an invocation refuses before
+                    // this point (output flags are unmodeled until Layer 2).
+                    _ if arg.starts_with("-Fo") || arg.starts_with("/Fo") => {}
+                    _ => out.push(arg.clone()),
+                }
+            }
+            out
         }
     }
-    out
 }
 
 /// Hash the preprocessor expansion of the translation unit.
 ///
-/// Runs `<cc> -E -P ...` with `SOURCE_DATE_EPOCH` pinned so the
+/// Runs `<cc> -E -P …` (gnu) or `<cc> /EP …` (clang-cl) — see
+/// [`build_preprocess_args`] — with `SOURCE_DATE_EPOCH` pinned so the
 /// `__DATE__` / `__TIME__` macros expand deterministically (without
-/// this the hash would change every second → ~0% hit rate). The
-/// expansion includes every `#include`d header transitively, so any
-/// header change invalidates the key automatically — no separate
-/// dependency tracking needed.
+/// this the hash would change every second → ~0% hit rate; gcc, clang,
+/// and clang-cl all honor it). The expansion includes every `#include`d
+/// header transitively, so any header change invalidates the key
+/// automatically — no separate dependency tracking needed. Bails (→
+/// passthrough) if the preprocessor yields empty stdout.
 fn preprocess_hash(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Result<String> {
     let pp_args = build_preprocess_args(parsed);
     crate::opcounts::record_preprocessor_run();
@@ -1020,6 +1234,13 @@ fn preprocess_hash(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Result<Strin
         // Bail so the wrapper falls back to passthrough, which runs
         // the real compiler and surfaces the real diagnostic.
         anyhow::bail!("preprocessor exited {} for cache key", output.status);
+    }
+    if output.stdout.is_empty() {
+        // Zero preprocessor output: a mis-detected family ran the wrong
+        // preprocess flags (gnu `-E -P` under clang-cl writes to a file),
+        // or a degenerate empty TU. Either way refuse rather than hash
+        // nothing → passthrough.
+        anyhow::bail!("preprocessor produced empty output for cache key");
     }
     let stdout = apply_cc_prefix_maps_to_bytes(output.stdout, prefix_maps);
     Ok(blake3::hash(&stdout).to_hex().to_string())
@@ -1080,6 +1301,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Regex(r"-O[0-3sz]?|-Og"),
         class: FlagClass::ModeledInKey,
         source: "PR #94 — opt level. Regex captures family; -Ofast/+others fall through to refuse.",
+        dialect: None,
     },
     FlagSpec {
         // `-g` family: bare or with a level digit (`-g0`..`-g3`). The
@@ -1089,21 +1311,25 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Regex(r"-g[0-3]?"),
         class: FlagClass::ModeledInKey,
         source: "PR #94 — debug level. Regex captures `-g`/`-g0..3`; -gdwarf-* etc. refuse.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fPIC"),
         class: FlagClass::ModeledInKey,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fpic"),
         class: FlagClass::ModeledInKey,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-std="),
         class: FlagClass::ModeledInKey,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         // Single `-arch <value>`. The parser sets `cache_target_arch`
@@ -1112,22 +1338,26 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-arch"),
         class: FlagClass::ModeledInKey,
         source: "PR #94",
+        dialect: None,
     },
     // ── ParserHandled: parser routes to structural invocation state ──
     FlagSpec {
         matcher: Matcher::Exact("-c"),
         class: FlagClass::ParserHandled,
         source: "PR #94 — compile mode marker parsed into CompileMode.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-E"),
         class: FlagClass::ParserHandled,
         source: "Flag audit — preprocessor mode marker parsed into CompileMode.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-S"),
         class: FlagClass::ParserHandled,
         source: "Flag audit — assembly mode marker parsed into CompileMode.",
+        dialect: None,
     },
     // ── CapturedByProbe: `cc -###` resolved tokens differentiate ──
     //
@@ -1147,51 +1377,61 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-mmacosx-version-min="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — Darwin deployment target.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-fstrict-flex-arrays="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — strict-flex-arrays codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-ffp-contract="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — fp-contract codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-pthread"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — pthread feature switch (also visible via _REENTRANT in preprocessor).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fstack-protector-strong"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — stack-protector codegen mode.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fstack-clash-protection"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #245 — stack-clash-protection codegen hardening (Firefox).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-math-errno"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — math-errno codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-strict-aliasing"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — alias-analysis codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-omit-frame-pointer"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — frame-pointer codegen knob.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-funwind-tables"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — unwind-tables codegen knob.",
+        dialect: None,
     },
     // Firefox debug-info & clang argument-wrapper flags
     // (kunobi-ninja/kache#117). The debug-info flags affect DWARF
@@ -1207,11 +1447,13 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-gdwarf-4"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #117 — DWARF v4 emission (Firefox baseline).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-gsimple-template-names"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #117 — clang template-name compression in debug info.",
+        dialect: None,
     },
     FlagSpec {
         // `-mllvm=` passes through to LLVM. Different `-mllvm`
@@ -1222,6 +1464,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-mllvm=-dwarf-linkage-names=Abstract"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #117 — LLVM debug-info abstraction (Firefox baseline). Listed by exact value rather than `-mllvm=*` wildcard so unmodeled LLVM flags still refuse.",
+        dialect: None,
     },
     // Compiler path-remapping flags: `-ffile-prefix-map` (= `-fdebug-prefix-map`
     // + `-fmacro-prefix-map`). Build systems pass these to make the OBJECT
@@ -1246,16 +1489,19 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-ffile-prefix-map="),
         class: FlagClass::CapturedByProbe,
         source: "Build-system path remapping (e.g. Firefox --enable-path-remapping). Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-fdebug-prefix-map="),
         class: FlagClass::CapturedByProbe,
         source: "Build-system debug-info path remapping. Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-fmacro-prefix-map="),
         class: FlagClass::CapturedByProbe,
         source: "Build-system __FILE__ path remapping. Resolved-token hash captures it; per-checkout `from` normalized via cc prefix maps.",
+        dialect: None,
     },
     // C++ ABI, RTTI, and exception flags (kunobi-ninja/kache#116).
     // Each row affects the resulting object materially — `-fno-rtti`
@@ -1276,36 +1522,43 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-stdlib="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ standard-library selector (libc++ / libstdc++).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-exceptions"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ exception mode (off).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fexceptions"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ exception mode (on).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-rtti"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ RTTI mode (off).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-frtti"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ RTTI mode (on).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-sized-deallocation"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ sized-deallocation (disabled).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-aligned-new"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #116 — C++ aligned new/delete (disabled).",
+        dialect: None,
     },
     // ELF symbol-visibility defaults (Firefox bench evidence, post-#146).
     // `-fvisibility=hidden` and `-fvisibility-inlines-hidden` are pure-
@@ -1324,11 +1577,13 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-fvisibility=hidden"),
         class: FlagClass::CapturedByProbe,
         source: "Firefox bench evidence (post-#146) — symbol visibility default = hidden.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fvisibility-inlines-hidden"),
         class: FlagClass::CapturedByProbe,
         source: "Firefox bench evidence (post-#146) — inline-function visibility default = hidden.",
+        dialect: None,
     },
     // Target / arch / WASM / ObjC / section flags
     // (kunobi-ninja/kache#115). Each row affects the resulting object
@@ -1352,6 +1607,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("--target="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — cross-compilation target triple (sticky form).",
+        dialect: None,
     },
     FlagSpec {
         // Separate-arg form: `-target <triple>`. The value classifies
@@ -1360,6 +1616,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-target"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — cross-compilation target triple (separate-arg form).",
+        dialect: None,
     },
     FlagSpec {
         // `-march=` family: `native`, `armv8-a`, `armv8.2-a+dotprod`,
@@ -1370,21 +1627,25 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Prefix("-march="),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — architecture selection. `Prefix` is safe because the probe resolves the value into target-cpu/target-feature tokens.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-msimd128"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — WASM SIMD128 enable.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-ffunction-sections"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — function-per-section object layout.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fdata-sections"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — data-per-section object layout.",
+        dialect: None,
     },
     FlagSpec {
         // `-Wa,*` passes through to the assembler. Different `-Wa,*`
@@ -1395,6 +1656,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-Wa,--noexecstack"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — assembler: non-executable stack section flag. Listed by exact value rather than `-Wa,*` wildcard so unmodeled assembler flags still refuse.",
+        dialect: None,
     },
     FlagSpec {
         // Separate-arg form: `-x <lang>`. Value is positional. The
@@ -1402,6 +1664,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-x"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — language override (separate-arg form).",
+        dialect: None,
     },
     FlagSpec {
         // Sticky language override forms. The parser records the
@@ -1412,82 +1675,98 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Regex(r"-x(?:c|c\+\+|objective-c|objective-c\+\+)"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 / flag audit — sticky language override forms.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fobjc-exceptions"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — Objective-C exception model.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fobjc-arc"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — Objective-C ARC mode.",
+        dialect: None,
     },
     // ── PreprocessorCaptured: cc -E -P expansion hash subsumes effect ──
     FlagSpec {
         matcher: Matcher::Prefix("-D"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-U"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-I"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("--sysroot"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-include"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-imacros"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-isystem"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-iquote"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-idirafter"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-isysroot"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-nostdinc"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-nostdinc++"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-undef"),
         class: FlagClass::PreprocessorCaptured,
         source: "PR #94",
+        dialect: None,
     },
     // ── NoObjectEffect: diagnostics / dep-info / build mechanics ──
     FlagSpec {
@@ -1500,31 +1779,37 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Regex(r"-W[^,]*"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94 — warnings. Regex excludes `-Wl,*`/`-Wa,*`/`-Wp,*` passthrough forms.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-w"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-pedantic"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Prefix("-fdiagnostics-"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fcolor-diagnostics"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-fno-color-diagnostics"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         // Dep-info generation: -MD, -MMD, -MF, -MT, -MQ, -MP, -MG.
@@ -1533,32 +1818,38 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         // table layout but the row stays declarative this way.
         matcher: Matcher::Regex(r"-MM?D|-M[FTQPG]"),
         class: FlagClass::NoObjectEffect,
-        source: "PR #94 — dep-info sidecar flags.",
+        source: "PR #94 — gcc dep-info flags. Gnu-dialect ONLY: in cl mode -MD/-MT/-MTd/-MDd are CRT selection (codegen), -MP is multi-process; they must not classify as inert dep-info (issue #285).",
+        dialect: Some(Dialect::Gnu),
     },
     FlagSpec {
         matcher: Matcher::Exact("-o"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-P"),
         class: FlagClass::NoObjectEffect,
         source: "Flag audit — preprocessor line-marker suppression has no compile-mode object effect.",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-pipe"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("-v"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("--verbose"),
         class: FlagClass::NoObjectEffect,
         source: "PR #94",
+        dialect: None,
     },
     // Clang argument-wrapper flags (kunobi-ninja/kache#117). These
     // bracket a section of the command line where clang suppresses
@@ -1570,11 +1861,423 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("--start-no-unused-arguments"),
         class: FlagClass::NoObjectEffect,
         source: "Issue #117 — clang unused-argument warning region (open).",
+        dialect: None,
     },
     FlagSpec {
         matcher: Matcher::Exact("--end-no-unused-arguments"),
         class: FlagClass::NoObjectEffect,
         source: "Issue #117 — clang unused-argument warning region (close).",
+        dialect: None,
+    },
+    // ── clang-cl flag classification (#285) ──────────────────────
+    //
+    // All rows below carry `dialect: Some(Dialect::Cl)` — they apply
+    // exclusively to clang-cl invocations. Gnu/clang dialect behaviour
+    // is unchanged.
+
+    // NoObjectEffect — output path and conformance flags that do not
+    // affect the resulting object bytes.
+    FlagSpec {
+        // `-Fo<obj>` / `/Fo<obj>` — object output path. Classified here
+        // so the classifier gate doesn't refuse it; the parser extracts
+        // it into `CcArgs.output` (Artifact bucket).
+        matcher: Matcher::Prefix("-Fo"),
+        class: FlagClass::NoObjectEffect,
+        source: "Issue #285 — clang-cl object output path, no object-content effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/Fo"),
+        class: FlagClass::NoObjectEffect,
+        source: "Issue #285 — clang-cl object output path, no object-content effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-Zc:inline` / `/Zc:inline` — clang-cl ignores this flag
+        // entirely in cc1; confirmed via -### that it generates no cc1
+        // token and produces no object-content difference.
+        matcher: Matcher::Exact("-Zc:inline"),
+        class: FlagClass::NoObjectEffect,
+        source: "Issue #285 — clang-cl ignores -Zc:inline (no cc1 token, no object effect).",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Zc:inline"),
+        class: FlagClass::NoObjectEffect,
+        source: "Issue #285 — clang-cl ignores /Zc:inline (no cc1 token, no object effect).",
+        dialect: Some(Dialect::Cl),
+    },
+    // ModeledInKey — language standard is extracted by the parser into
+    // `CcArgs.std` and folded directly into the cache key.
+    FlagSpec {
+        matcher: Matcher::Prefix("-std:"),
+        class: FlagClass::ModeledInKey,
+        source: "Issue #285 — clang-cl language standard (-std:c++NN); modeled in key via CcArgs.std.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/std:"),
+        class: FlagClass::ModeledInKey,
+        source: "Issue #285 — clang-cl language standard (/std:c++NN); modeled in key via CcArgs.std.",
+        dialect: Some(Dialect::Cl),
+    },
+    // PreprocessorCaptured — forced-include headers enter the /EP
+    // preprocessor hash, so their content is already in the key.
+    FlagSpec {
+        matcher: Matcher::Prefix("-FI"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "Issue #285 — clang-cl forced include; content captured by /EP preprocessor hash.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/FI"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "Issue #285 — clang-cl forced include; content captured by /EP preprocessor hash.",
+        dialect: Some(Dialect::Cl),
+    },
+    // CapturedByProbe — keyed via the clang-cl -### resolved-token
+    // stream. Different values produce different cc1 tokens → different
+    // keys. Safe only when the probe resolves; `cc_flags_need_resolved_invocation`
+    // ensures the key refuses if the probe is unavailable.
+    FlagSpec {
+        // `-guard:cf` / `-guard:cf,nochecks` / `/guard:cf` etc. The
+        // `Prefix` wildcard is intentional and safe here BECAUSE this is
+        // CapturedByProbe: clang-cl -### resolves each guard variant into
+        // a distinct -cc1 token (e.g. `-cfguard`) so the key differentiates
+        // per-value automatically. An unrecognized guard variant still
+        // produces a distinct -### token → distinct key (no miscache risk).
+        matcher: Matcher::Prefix("-guard:"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl Control Flow Guard. Prefix wildcard safe: -### resolves each variant to a distinct -cc1 token.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/guard:"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl Control Flow Guard (/guard: spelling). Prefix wildcard safe: -### resolves each variant to a distinct -cc1 token.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-fms-compatibility-version=<ver>` — MSVC version emulation.
+        // `Prefix` wildcard is safe here BECAUSE this is CapturedByProbe:
+        // clang-cl -### reflects the exact version number into a -cc1
+        // token, so different versions produce different keys.
+        matcher: Matcher::Prefix("-fms-compatibility-version="),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — MSVC compatibility version. Prefix wildcard safe: -### reflects the exact version into a -cc1 token.",
+        dialect: Some(Dialect::Cl),
+    },
+    // Function/global inlining and frame-pointer optimizations.
+    FlagSpec {
+        matcher: Matcher::Exact("-Gy"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl function-level linking (COMDAT). Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Gy"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl function-level linking (COMDAT). Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-Gw"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl global data optimization (COMDAT). Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Gw"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl global data optimization (COMDAT). Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-Oy-"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl frame-pointer omission disabled. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Oy-"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl frame-pointer omission disabled. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    // CRT (C Runtime) selection flags. Under Cl these are codegen flags
+    // (they define `_MT`/`_DLL` macros and link the appropriate CRT),
+    // not dep-info markers (cf. the Gnu-dialect row above which tags
+    // the same spellings as NoObjectEffect).
+    FlagSpec {
+        matcher: Matcher::Exact("-MD"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl CRT: multithreaded DLL (dynamic). Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-MDd"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl CRT: multithreaded DLL debug. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-MT"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl CRT: multithreaded static. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-MTd"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl CRT: multithreaded static debug. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/MD"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl CRT: multithreaded DLL (dynamic). Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/MDd"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl CRT: multithreaded DLL debug. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/MT"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl CRT: multithreaded static. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/MTd"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl CRT: multithreaded static debug. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // clang-cl optimization levels, `-` and `/` spellings, keyed via
+        // the cc1 level in `-###`. NOTE: the bare `-O1`/`-O2` spellings
+        // are already matched by the earlier dialect-agnostic `-O[0-3sz]?`
+        // ModeledInKey row (→ `parsed.optimization`), so this row only
+        // fires for `/O1`/`/O2`/`-Od`/`/Od`/`-Ox`/`/Ox`. Both paths key
+        // the level, just by different mechanisms. `-Os`/`-Oz`/`-Ofast`
+        // are not in this set and still refuse.
+        matcher: Matcher::Regex(r"[-/]O[12dx]"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #285 — clang-cl optimization levels. Bare -O1/-O2 are caught earlier as ModeledInKey; this row covers /Onn and -Od/-Ox. -### resolves each to a distinct cc1 level. -Ofast/-Os/-Oz not matched → still refuse.",
+        dialect: Some(Dialect::Cl),
+    },
+    // ── clang-cl Layer 4: Firefox-corpus flag classification (#285) ──
+    //
+    // All rows carry `dialect: Some(Dialect::Cl)`. Gnu/clang dialect
+    // behaviour is unchanged.
+
+    // ── CapturedByProbe: exception / RTTI / stack-protector / misc codegen ──
+    //
+    // Each row's effect is reflected in the clang-cl -### token stream:
+    //   -EHsc   → -fexceptions + -fcxx-exceptions
+    //   -GR-    → -fno-rtti
+    //   -GS-    → removes -stack-protector from cc1
+    //   -Brepro → removes -mincremental-linker-compatible from cc1
+    //   -utf-8  → clang-cl is UTF-8 by default; the flag is inert (no cc1 token)
+    //             but remains CapturedByProbe — keyed if it ever produces a token,
+    //             inert if not; the probe requirement is always met for clang-cl.
+    //   -Zc:*   → various conformance knobs reflected into cc1 tokens per value.
+    //             NOTE: `-Zc:inline` / `/Zc:inline` are listed BEFORE these Prefix
+    //             rows (exact rows appear earlier in the table) so they continue to
+    //             resolve as NoObjectEffect via first-match.
+    // `Prefix` wildcards on CapturedByProbe are safe: the -### stream captures the
+    // exact value (or the flag is inert), so an unknown suffix still produces a
+    // distinct key (no miscache risk).
+    FlagSpec {
+        matcher: Matcher::Prefix("-EH"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl exception model (-EHsc, -EHs-c-, …). Prefix safe: -### resolves each variant into distinct -fexceptions/-fcxx-exceptions tokens (or their negations).",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/EH"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl exception model (/EH* spelling). Prefix safe: -### resolves each variant into distinct -fexceptions/-fcxx-exceptions tokens (or their negations).",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-GR"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl RTTI enabled (-GR). -### reflects -frtti.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-GR-"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl RTTI disabled (-GR-). -### reflects -fno-rtti.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/GR"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl RTTI enabled (/GR). -### reflects -frtti.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/GR-"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl RTTI disabled (/GR-). -### reflects -fno-rtti.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-GS"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl stack-buffer-security-check enabled (-GS). -### reflects -stack-protector.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-GS-"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl stack-buffer-security-check disabled (-GS-). -### removes -stack-protector.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/GS"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl stack-buffer-security-check enabled (/GS). -### reflects -stack-protector.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/GS-"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl stack-buffer-security-check disabled (/GS-). -### removes -stack-protector.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-Brepro"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl reproducible build (-Brepro). -### removes -mincremental-linker-compatible.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Brepro"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl reproducible build (/Brepro). -### removes -mincremental-linker-compatible.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-utf-8"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl UTF-8 source/execution charset (-utf-8). clang-cl is UTF-8 by default; the flag produces no cc1 token but is inert — CapturedByProbe is safe (keyed if token present, inert if not; probe always resolves for clang-cl).",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/utf-8"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl UTF-8 source/execution charset (/utf-8). Same rationale as -utf-8.",
+        dialect: Some(Dialect::Cl),
+    },
+    // -Zc: conformance flags. The Exact rows for -Zc:inline / /Zc:inline
+    // appear EARLIER in the table and resolve first (NoObjectEffect), so
+    // only non-inline -Zc: values reach these Prefix rows.
+    FlagSpec {
+        matcher: Matcher::Prefix("-Zc:"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl conformance flags (-Zc:wchar_t, -Zc:forScope, …). Prefix safe: -### captures the exact value (or flag is inert); placed AFTER the -Zc:inline Exact row so that spelling resolves NoObjectEffect first.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/Zc:"),
+        class: FlagClass::CapturedByProbe,
+        source: "#285 Layer 4 — clang-cl conformance flags (/Zc:* spelling). Prefix safe: -### captures the exact value (or flag is inert); placed AFTER the /Zc:inline Exact row so that spelling resolves NoObjectEffect first.",
+        dialect: Some(Dialect::Cl),
+    },
+    // ── PreprocessorCaptured: -FC makes __FILE__ expand to the full path ──
+    //
+    // clang-cl's `/EP` preprocessor hash captures `__FILE__` expansions,
+    // so `-FC`'s effect (full path in `__FILE__`) is already in the key.
+    FlagSpec {
+        matcher: Matcher::Exact("-FC"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "#285 Layer 4 — clang-cl full-path __FILE__ (-FC). Makes __FILE__ expand to the absolute source path; that expansion is captured by the /EP preprocessor hash.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/FC"),
+        class: FlagClass::PreprocessorCaptured,
+        source: "#285 Layer 4 — clang-cl full-path __FILE__ (/FC). Makes __FILE__ expand to the absolute source path; that expansion is captured by the /EP preprocessor hash.",
+        dialect: Some(Dialect::Cl),
+    },
+    // ── NoObjectEffect: diagnostics / build mechanics ──
+    //
+    // None of these flags change the resulting object bytes.
+    FlagSpec {
+        matcher: Matcher::Exact("-nologo"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl suppress banner (-nologo). Pure build-output mechanic; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/nologo"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl suppress banner (/nologo). Pure build-output mechanic; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-wdNNNN` / `/wdNNNN` — disable a specific warning by number.
+        // Warnings only affect diagnostics, never the object.
+        matcher: Matcher::Prefix("-wd"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl disable warning (-wdNNNN). Diagnostics only; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/wd"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl disable warning (/wdNNNN). Diagnostics only; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-FS` / `/FS` — force synchronous PDB writes (serializes access
+        // to the shared .pdb across parallel compilations). Pure build
+        // mechanic; has no effect on the object file content.
+        matcher: Matcher::Exact("-FS"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl force synchronous PDB writes (-FS). Build mechanic; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/FS"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl force synchronous PDB writes (/FS). Build mechanic; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-Gm-` / `/Gm-` — disable minimal rebuild (deprecated MSVC flag).
+        // Has no effect on the object content.
+        matcher: Matcher::Exact("-Gm-"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl minimal rebuild disabled (-Gm-, deprecated). No object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Gm-"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl minimal rebuild disabled (/Gm-, deprecated). No object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        // `-external:W<n>` / `/external:W<n>` and similar external-header
+        // warning-level flags. These only affect diagnostics for headers
+        // treated as "external" (system headers); no object effect.
+        matcher: Matcher::Prefix("-external:"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl external-header warning level (-external:*). Diagnostics only; no object effect.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/external:"),
+        class: FlagClass::NoObjectEffect,
+        source: "#285 Layer 4 — clang-cl external-header warning level (/external:*). Diagnostics only; no object effect.",
+        dialect: Some(Dialect::Cl),
     },
 ];
 
@@ -1624,8 +2327,9 @@ fn classify_and_trace_cc_flags<'a>(
     let mut summary = FlagClassificationSummary::default();
     let mut rejected = Vec::new();
 
+    let dialect = parsed.family.dialect();
     for arg in &parsed.rest {
-        let analysis = analyze_cc_arg(arg);
+        let analysis = analyze_cc_arg(arg, dialect);
         summary.record(analysis.class);
         match analysis.class {
             Some(class) => tracing::trace!(
@@ -1677,12 +2381,14 @@ fn cc_extra_flags_for_key<'a>(
     if extra_allowlist_flags.is_empty() {
         return Vec::new();
     }
+    let dialect = parsed.family.dialect();
     let mut matched: Vec<&str> = parsed
         .rest
         .iter()
         .map(String::as_str)
         .filter(|arg| {
-            classify_cc_flag(arg).is_none() && extra_allowlist_flags.iter().any(|f| f == arg)
+            classify_cc_flag(arg, dialect).is_none()
+                && extra_allowlist_flags.iter().any(|f| f == arg)
         })
         .collect();
     matched.sort_unstable();
@@ -1690,14 +2396,14 @@ fn cc_extra_flags_for_key<'a>(
     matched
 }
 
-fn analyze_cc_arg(arg: &str) -> CcArgAnalysis<'_> {
-    let class = classify_cc_flag(arg);
-    let spec = cc_arg_spec_for_token(arg);
+fn analyze_cc_arg(arg: &str, dialect: Dialect) -> CcArgAnalysis<'_> {
+    let class = classify_cc_flag(arg, dialect);
+    let spec = cc_arg_spec_for_token(arg, dialect);
     CcArgAnalysis {
         arg,
         class,
         bucket: cc_arg_bucket(class, spec),
-        normalized: normalize_cc_arg(arg),
+        normalized: normalize_cc_arg(arg, dialect),
         refusal: class.is_none().then_some("cc: unsupported flag"),
         source: spec.map(|spec| spec.source),
     }
@@ -1720,8 +2426,8 @@ fn cc_arg_bucket(class: Option<FlagClass>, spec: Option<&'static CcArgSpec>) -> 
     }
 }
 
-fn normalize_cc_arg(arg: &str) -> Vec<String> {
-    let Some(spec) = cc_arg_spec_for_token(arg) else {
+fn normalize_cc_arg(arg: &str, dialect: Dialect) -> Vec<String> {
+    let Some(spec) = cc_arg_spec_for_token(arg, dialect) else {
         return vec![arg.to_string()];
     };
     match spec.value_form {
@@ -1743,15 +2449,23 @@ fn normalize_cc_arg(arg: &str) -> Vec<String> {
     }
 }
 
-fn cc_arg_spec_for_token(arg: &str) -> Option<&'static CcArgSpec> {
-    CC_ARG_SPECS.iter().find(|spec| match spec.value_form {
-        CcArgValueForm::Flag | CcArgValueForm::Separated => cc_arg_spec_matches(spec, arg),
-        CcArgValueForm::Concatenated { prefix } => arg.starts_with(prefix),
-        CcArgValueForm::CanBeSeparated { prefix } => {
-            arg == prefix
-                || arg
-                    .strip_prefix(prefix)
-                    .is_some_and(|value| !value.is_empty())
+fn cc_arg_spec_for_token(arg: &str, dialect: Dialect) -> Option<&'static CcArgSpec> {
+    CC_ARG_SPECS.iter().find(|spec| {
+        // Skip rows restricted to a different dialect, so a token shared
+        // across dialects (e.g. `-MT`) resolves to the row for the active
+        // dialect — not whichever appears first in the table.
+        if spec.dialect.is_some_and(|d| d != dialect) {
+            return false;
+        }
+        match spec.value_form {
+            CcArgValueForm::Flag | CcArgValueForm::Separated => cc_arg_spec_matches(spec, arg),
+            CcArgValueForm::Concatenated { prefix } => arg.starts_with(prefix),
+            CcArgValueForm::CanBeSeparated { prefix } => {
+                arg == prefix
+                    || arg
+                        .strip_prefix(prefix)
+                        .is_some_and(|value| !value.is_empty())
+            }
         }
     })
 }
@@ -1760,20 +2474,22 @@ fn cc_arg_spec_for_token(arg: &str) -> Option<&'static CcArgSpec> {
 /// over [`CC_FLAGS`] with a lazy regex cache. Returns `None` for any
 /// argument no row matches — the caller treats that as "unsupported
 /// flag, refuse to cache".
-fn classify_cc_flag(arg: &str) -> Option<FlagClass> {
+fn classify_cc_flag(arg: &str, dialect: Dialect) -> Option<FlagClass> {
     static CACHE: OnceLock<HashMap<&'static str, Regex>> = OnceLock::new();
     crate::compiler::flags::classify_against(
         arg,
         CC_FLAGS,
         CACHE.get_or_init(|| crate::compiler::flags::build_regex_cache(CC_FLAGS)),
+        dialect,
     )
 }
 
 fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
+    let dialect = parsed.family.dialect();
     parsed
         .rest
         .iter()
-        .any(|arg| analyze_cc_arg(arg).bucket == CcArgBucket::ProbeKeyed)
+        .any(|arg| analyze_cc_arg(arg, dialect).bucket == CcArgBucket::ProbeKeyed)
 }
 
 /// Prefix maps that make C/C++ objects path-stable across worktrees.
@@ -1808,6 +2524,14 @@ fn cc_prefix_maps(parsed: &CcArgs) -> Vec<CcPrefixMap> {
 /// Deterministic core of [`cc_prefix_maps`] (reads no env) — the derived
 /// roots plus an optional user `base_dir` (`KACHE_BASE_DIR`).
 fn cc_prefix_maps_cfg(parsed: &CcArgs, cwd: &Path, base_dir: Option<&Path>) -> Vec<CcPrefixMap> {
+    // clang-cl ignores `-ffile-prefix-map`, so prefix-mapping the key over
+    // an object that still embeds raw paths would miscache. Until Layer 3
+    // proves a cl path-remap, cl keys stay path-literal (unnormalised
+    // `-###` abs paths make them per-machine — misses, never miscache) and
+    // `execute` injects nothing.
+    if parsed.family.dialect() == Dialect::Cl {
+        return Vec::new();
+    }
     let mut maps = cc_prefix_maps_for(parsed, cwd);
 
     // User-declared base dir (ccache `CCACHE_BASEDIR` analog). An explicit
@@ -2651,6 +3375,233 @@ mod tests {
         args.iter().map(|a| a.to_string()).collect()
     }
 
+    #[test]
+    fn cc_flags_dep_info_is_gnu_only() {
+        use crate::compiler::flags::{Dialect, FlagClass};
+        // The `-MM?D|-M[FTQPG]` gnu dep-info row is tagged Gnu-only.
+        // Under Gnu every spelling is inert (NoObjectEffect).
+        for flag in ["-MD", "-MMD", "-MT", "-MF", "-MQ", "-MP", "-MG"] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                Some(FlagClass::NoObjectEffect),
+                "{flag} should be inert dep-info under Gnu"
+            );
+        }
+        // Under Cl:
+        // - `-MD` and `-MT` are CRT-selection flags, classified as
+        //   CapturedByProbe by the Layer 2 cl rows. They must NOT refuse.
+        for flag in ["-MD", "-MT"] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Cl),
+                Some(FlagClass::CapturedByProbe),
+                "{flag} should be CapturedByProbe under Cl (CRT selection)"
+            );
+        }
+        // - The rest (`-MMD`, `-MF`, `-MQ`, `-MP`, `-MG`) have no
+        //   cl-specific row and still refuse (return None) under Cl.
+        for flag in ["-MMD", "-MF", "-MQ", "-MP", "-MG"] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Cl),
+                None,
+                "{flag} must refuse under Cl (no cl-specific row)"
+            );
+        }
+        // a dialect-less row still classifies under both
+        assert_eq!(
+            classify_cc_flag("-DFOO", Dialect::Cl),
+            Some(FlagClass::PreprocessorCaptured)
+        );
+    }
+
+    #[test]
+    fn clang_cl_flag_classification() {
+        use crate::compiler::flags::{Dialect, FlagClass};
+        let cl = Dialect::Cl;
+        // codegen → CapturedByProbe (keyed via -###).
+        // Note: bare -O1/-O2 stay ModeledInKey under Cl — the earlier
+        // dialect-agnostic `-O[0-3sz]?` CC_FLAGS row matches them first.
+        // The /Onn forms, -Od, and -Ox fall through to the cl regex →
+        // CapturedByProbe. Both mechanisms key the level (no collision).
+        for f in [
+            "-guard:cf,nochecks",
+            "-Gy",
+            "-Gw",
+            "-Oy-",
+            "-fms-compatibility-version=19.50",
+            "-MD",
+            "-MT",
+            "/MD",
+            "/O2",
+        ] {
+            assert_eq!(
+                classify_cc_flag(f, cl),
+                Some(FlagClass::CapturedByProbe),
+                "{f}"
+            );
+        }
+        // output + ignored → NoObjectEffect (accepted, not keyed)
+        for f in ["-Fofoo.obj", "/Fofoo.obj", "-Zc:inline"] {
+            assert_eq!(
+                classify_cc_flag(f, cl),
+                Some(FlagClass::NoObjectEffect),
+                "{f}"
+            );
+        }
+        // standard → ModeledInKey; forced include → PreprocessorCaptured
+        assert_eq!(
+            classify_cc_flag("-std:c++20", cl),
+            Some(FlagClass::ModeledInKey)
+        );
+        assert_eq!(
+            classify_cc_flag("-FIfoo.h", cl),
+            Some(FlagClass::PreprocessorCaptured)
+        );
+        // gnu unaffected: -MD is still inert dep-info under Gnu
+        assert_eq!(
+            classify_cc_flag("-MD", Dialect::Gnu),
+            Some(FlagClass::NoObjectEffect)
+        );
+    }
+
+    #[test]
+    fn parse_records_tool_family() {
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "a.c"])).unwrap();
+        assert_eq!(gnu.family, ToolFamily::Gnu);
+        let cl = CcArgs::parse(&s(&["clang-cl.exe", "-c", "a.c"])).unwrap();
+        assert_eq!(cl.family, ToolFamily::ClangCl);
+    }
+
+    #[test]
+    fn tool_family_detects_clang_cl_and_dialects() {
+        use crate::compiler::flags::Dialect;
+        let f = |prog: &str, rest: &[&str]| ToolFamily::detect(prog, &s(rest));
+
+        assert_eq!(f("clang-cl", &[]), ToolFamily::ClangCl);
+        assert_eq!(f("clang-cl.exe", &[]), ToolFamily::ClangCl);
+        assert_eq!(f(r"C:\VS\bin\clang-cl.EXE", &[]), ToolFamily::ClangCl);
+        assert_eq!(f("clang", &["--driver-mode=cl"]), ToolFamily::ClangCl);
+        assert_eq!(f("clang", &[]), ToolFamily::Clang);
+        assert_eq!(f("clang++-17", &[]), ToolFamily::Clang);
+        assert_eq!(f("clang-15", &[]), ToolFamily::Clang);
+        // Only an exact `clang-cl` basename (or --driver-mode=cl) is cl;
+        // a versioned `clang-cl-17` symlink has stem "clang" → Clang.
+        assert_eq!(f("clang-cl-17", &[]), ToolFamily::Clang);
+        assert_eq!(f("gcc", &[]), ToolFamily::Gnu);
+        assert_eq!(f("/usr/bin/cc", &[]), ToolFamily::Gnu);
+        assert_eq!(f("g++", &[]), ToolFamily::Gnu);
+
+        assert_eq!(ToolFamily::Gnu.dialect(), Dialect::Gnu);
+        assert_eq!(ToolFamily::Clang.dialect(), Dialect::Gnu);
+        assert_eq!(ToolFamily::ClangCl.dialect(), Dialect::Cl);
+    }
+
+    // ── dialect-aware parser ─────────────────────────────────────
+
+    #[test]
+    fn clang_cl_output_and_std_parse() {
+        use crate::compiler::flags::Dialect;
+        let p = CcArgs::parse(&s(&[
+            "clang-cl",
+            "-c",
+            "-Fobuild\\foo.obj",
+            "-std:c++20",
+            "foo.c",
+        ]))
+        .unwrap();
+        assert_eq!(p.family.dialect(), Dialect::Cl);
+        assert_eq!(p.output.as_ref().unwrap().to_str(), Some("build\\foo.obj"));
+        assert_eq!(
+            p.object_output_path().unwrap().to_str(),
+            Some("build\\foo.obj")
+        );
+        assert_eq!(p.std.as_deref(), Some("c++20"));
+        // /-spellings too
+        let q =
+            CcArgs::parse(&s(&["clang-cl", "-c", "/Fofoo.obj", "/std:c++17", "foo.c"])).unwrap();
+        assert_eq!(q.output.as_ref().unwrap().to_str(), Some("foo.obj"));
+        assert_eq!(q.std.as_deref(), Some("c++17"));
+    }
+
+    #[test]
+    fn parser_skips_gnu_only_rows_under_cl() {
+        // -MT is a value-consuming gnu dep row. Under gcc the parser
+        // consumes it AND its following token; under clang-cl the gnu row
+        // is skipped (there -MT is single-token CRT selection), so the
+        // next token is parsed independently rather than swallowed. The
+        // value token carries a source extension so a broken skip is
+        // observable: if -MT failed to consume it, it would surface as a
+        // second source.
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "-MT", "tgt.c", "a.c"])).unwrap();
+        assert_eq!(gnu.sources.len(), 1, "-MT should consume tgt.c under gnu");
+        assert_eq!(gnu.sources[0].to_str(), Some("a.c"));
+
+        // Under clang-cl the gnu -MT row is skipped, so -MT does NOT
+        // consume the following token; a.c is still the source. (If the
+        // skip were broken, -MT would swallow a.c → sources empty.)
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "-MT", "a.c"])).unwrap();
+        assert_eq!(cl.sources.len(), 1, "-MT must not consume a.c under cl");
+        assert_eq!(cl.sources[0].to_str(), Some("a.c"));
+    }
+
+    #[test]
+    fn config_args_keeps_crt_flags_under_cl_strips_dep_under_gnu() {
+        // Gnu: -MT is per-TU dep-target noise → stripped (with its value).
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "-MT", "tgt", "-DFOO", "a.c"])).unwrap();
+        assert!(!gnu.config_args().iter().any(|a| a == "-MT" || a == "tgt"));
+        assert!(gnu.config_args().iter().any(|a| a == "-DFOO"));
+
+        // Cl: -MT is CRT selection (CapturedByProbe) → MUST stay in the
+        // probe-memo key, or a -MT compile reuses a -MD record (false hit).
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "-MT", "-DFOO", "a.c"])).unwrap();
+        assert!(cl.config_args().iter().any(|a| a == "-MT"));
+
+        // -MD — the spelling that motivated #285 — must likewise stay.
+        let cl_md = CcArgs::parse(&s(&["clang-cl", "-c", "-MD", "-DFOO", "a.c"])).unwrap();
+        assert!(cl_md.config_args().iter().any(|a| a == "-MD"));
+    }
+
+    #[test]
+    fn config_args_strips_clang_cl_output() {
+        let p = CcArgs::parse(&s(&["clang-cl", "-c", "-Fofoo.obj", "-guard:cf", "foo.c"])).unwrap();
+        let cfg = p.config_args();
+        assert!(
+            !cfg.iter().any(|a| a.starts_with("-Fo")),
+            "-Fo must be stripped from probe-memo key: {cfg:?}"
+        );
+        assert!(
+            cfg.iter().any(|a| a == "-guard:cf"),
+            "codegen flag must stay: {cfg:?}"
+        );
+    }
+
+    #[test]
+    fn clang_cl_firefox_style_invocation_is_cacheable() {
+        // The flags from issue #285's swgl log, minus -Z7 (debug, refused until Layer 3).
+        let p = CcArgs::parse(&s(&[
+            "clang-cl",
+            "-c",
+            "foo.c",
+            "-Fofoo.obj",
+            "-fms-compatibility-version=19.50",
+            "-guard:cf,nochecks",
+            "-Gy",
+            "-Gw",
+            "-Oy-",
+            "-Zc:inline",
+            "-MD",
+        ]))
+        .unwrap();
+        let refuse = p.refuse_reasons(&[]);
+        assert!(
+            refuse.is_empty(),
+            "should be cacheable, refused: {:?}",
+            refuse.iter().map(|r| r.description()).collect::<Vec<_>>()
+        );
+        // And with -Z7 it MUST refuse (debug, Layer 1 guard).
+        let dbg = CcArgs::parse(&s(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-Z7"])).unwrap();
+        assert!(!dbg.refuse_reasons(&[]).is_empty());
+    }
+
     // ── recognize ────────────────────────────────────────────────
 
     #[test]
@@ -3276,6 +4227,52 @@ mod tests {
             descs.iter().any(|d| d.contains("response file")),
             "expected response-file refuse, got: {descs:?}"
         );
+    }
+
+    #[test]
+    fn cl_slash_flag_refuses_but_gnu_treats_it_positional() {
+        // Layer 0's most operator-visible invariant, end to end: under
+        // clang-cl an unmodeled `/`-flag fails closed (refuse →
+        // passthrough); under gcc the same token is an inert positional,
+        // so it does not produce an unsupported-flag refusal.
+        //
+        // Note: `/O2` was previously the unmodeled example but Layer 2
+        // now classifies it as CapturedByProbe. Use `/unknown` (genuinely
+        // unmodeled) to keep testing the invariant that an unclassified
+        // slash flag refuses under Cl but not under Gnu.
+        let cl = refuse_descriptions(&["clang-cl", "-c", "/unknown", "a.c"]);
+        assert!(
+            cl.iter().any(|d| d.contains("unsupported flag")),
+            "clang-cl /unknown should refuse as an unsupported flag, got: {cl:?}"
+        );
+        let gnu = refuse_descriptions(&["gcc", "-c", "/unknown", "a.c"]);
+        assert!(
+            !gnu.iter().any(|d| d.contains("unsupported flag")),
+            "gcc /unknown is an inert positional, not an unsupported flag, got: {gnu:?}"
+        );
+        // But /O2 itself is now modeled (CapturedByProbe) and must not refuse.
+        let cl_o2 = refuse_descriptions(&["clang-cl", "-c", "/O2", "a.c"]);
+        assert!(
+            !cl_o2.iter().any(|d| d.contains("unsupported flag")),
+            "clang-cl /O2 is now CapturedByProbe (Layer 2) and must not refuse, got: {cl_o2:?}"
+        );
+    }
+
+    #[test]
+    fn clang_cl_debug_refuses_until_layer3() {
+        // The `-g` form (parsed into debug_level) and the native MSVC
+        // `/Z7` / `-Z7` spellings (not yet modeled) must both refuse with
+        // the clang-cl debug reason — this guard owns the contract.
+        for flag in ["-g2", "/Z7", "-Z7", "/Zi"] {
+            let descs = refuse_descriptions(&["clang-cl", "-c", flag, "a.c"]);
+            assert!(
+                descs.iter().any(|d| d.contains("clang-cl debug")),
+                "{flag} should refuse with the clang-cl debug reason, got: {descs:?}"
+            );
+        }
+        // gcc debug never hits the clang-cl path-embedding refusal.
+        let gnu = refuse_descriptions(&["gcc", "-c", "-g2", "a.c"]);
+        assert!(!gnu.iter().any(|d| d.contains("clang-cl debug")));
     }
 
     #[test]
@@ -4012,7 +5009,7 @@ mod tests {
             ("-xobjective-c", FlagClass::CapturedByProbe),
         ] {
             assert_eq!(
-                classify_cc_flag(flag),
+                classify_cc_flag(flag, Dialect::Gnu),
                 Some(expected),
                 "{flag} should have the expected class"
             );
@@ -4020,8 +5017,21 @@ mod tests {
     }
 
     #[test]
+    fn cc_arg_spec_for_token_filters_by_dialect() {
+        // `-MT` is a dep-target parse row tagged Gnu-only (Layer 0). It
+        // must resolve under Gnu but NOT under Cl — otherwise a future cl
+        // row for an overlapping spelling would be shadowed by the gnu
+        // row (the Layer 2 prerequisite).
+        assert!(cc_arg_spec_for_token("-MT", Dialect::Gnu).is_some());
+        assert!(cc_arg_spec_for_token("-MT", Dialect::Cl).is_none());
+        // A dialect-less row (`-o`) resolves under both.
+        assert!(cc_arg_spec_for_token("-o", Dialect::Gnu).is_some());
+        assert!(cc_arg_spec_for_token("-o", Dialect::Cl).is_some());
+    }
+
+    #[test]
     fn arg_analysis_exposes_bucket_and_normalized_value_form() {
-        let language = analyze_cc_arg("-xc++");
+        let language = analyze_cc_arg("-xc++", Dialect::Gnu);
         assert_eq!(language.class, Some(FlagClass::CapturedByProbe));
         assert_eq!(language.bucket, CcArgBucket::ProbeKeyed);
         assert_eq!(
@@ -4030,7 +5040,7 @@ mod tests {
         );
         assert_eq!(language.refusal, None);
 
-        let include = analyze_cc_arg("-Ivendor");
+        let include = analyze_cc_arg("-Ivendor", Dialect::Gnu);
         assert_eq!(include.class, Some(FlagClass::PreprocessorCaptured));
         assert_eq!(include.bucket, CcArgBucket::Preprocessor);
         assert_eq!(
@@ -4038,7 +5048,7 @@ mod tests {
             vec!["-I".to_string(), "vendor".to_string()]
         );
 
-        let unknown = analyze_cc_arg("-funknown");
+        let unknown = analyze_cc_arg("-funknown", Dialect::Gnu);
         assert_eq!(unknown.class, None);
         assert_eq!(unknown.bucket, CcArgBucket::TooHard);
         assert_eq!(unknown.refusal, Some("cc: unsupported flag"));
@@ -4321,6 +5331,14 @@ mod tests {
     }
 
     #[test]
+    fn object_output_path_defaults_to_obj_for_clang_cl() {
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "foo.c"])).unwrap();
+        assert_eq!(cl.object_output_path().unwrap().to_str(), Some("foo.obj"));
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "foo.c"])).unwrap();
+        assert_eq!(gnu.object_output_path().unwrap().to_str(), Some("foo.o"));
+    }
+
+    #[test]
     fn depinfo_output_path_uses_mf_or_object_stem() {
         let explicit =
             CcArgs::parse(&s(&["cc", "-c", "foo.c", "-MMD", "-MF", "deps/foo.d"])).unwrap();
@@ -4372,6 +5390,43 @@ mod tests {
                 "{stripped} should be stripped from preprocess args, got {pp:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_preprocess_args_uses_ep_for_clang_cl() {
+        use crate::compiler::flags::Dialect;
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "a.c", "-DFOO"])).unwrap();
+        assert_eq!(cl.family.dialect(), Dialect::Cl);
+        let args = build_preprocess_args(&cl);
+        assert_eq!(args.first().map(String::as_str), Some("/EP"));
+        assert!(!args.iter().any(|a| a == "-E" || a == "-P"));
+        assert!(args.iter().any(|a| a == "-DFOO"));
+        assert!(args.iter().any(|a| a == "a.c"));
+        assert!(!args.iter().any(|a| a == "-c"));
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "a.c"])).unwrap();
+        let g = build_preprocess_args(&gnu);
+        assert_eq!(&g[..2], &["-E".to_string(), "-P".to_string()]);
+    }
+
+    #[test]
+    fn cc_prefix_maps_empty_for_clang_cl() {
+        let cwd = std::path::Path::new("/work/proj");
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/work/proj/a.c"])).unwrap();
+        assert!(cc_prefix_maps_cfg(&cl, cwd, None).is_empty());
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "/work/proj/a.c"])).unwrap();
+        assert!(!cc_prefix_maps_cfg(&gnu, cwd, None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preprocess_hash_bails_on_empty_stdout() {
+        // `true` ignores args and prints nothing → empty preprocessor
+        // output, which the tripwire refuses. (A legitimately empty TU —
+        // all comments / all `#if 0` — also lands here; refusing to cache
+        // it is a safe non-cache, the conservative trade-off.)
+        let parsed = CcArgs::parse(&s(&["true", "-c", "a.c"])).unwrap();
+        let err = preprocess_hash(&parsed, &[]).unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
     }
 
     #[test]
@@ -4801,5 +5856,101 @@ mod tests {
             obj.exists(),
             "object must be (re-)created by the stand-in compiler"
         );
+    }
+
+    // ── Layer 4: Firefox-corpus clang-cl flag classification ─────
+
+    #[test]
+    fn clang_cl_layer4_flag_classification() {
+        use crate::compiler::flags::{Dialect, FlagClass};
+        let cl = Dialect::Cl;
+        // object-material → CapturedByProbe
+        for f in [
+            "-EHsc",
+            "-EHs-c-",
+            "/EHsc",
+            "-GR-",
+            "/GR-",
+            "-GS-",
+            "/GS",
+            "-Brepro",
+            "-utf-8",
+            "-Zc:wchar_t",
+            "-Zc:forScope-",
+        ] {
+            assert_eq!(
+                classify_cc_flag(f, cl),
+                Some(FlagClass::CapturedByProbe),
+                "{f}"
+            );
+        }
+        // -Zc:inline stays NoObjectEffect (Layer 2 Exact row matched first)
+        assert_eq!(
+            classify_cc_flag("-Zc:inline", cl),
+            Some(FlagClass::NoObjectEffect)
+        );
+        // __FILE__-affecting → PreprocessorCaptured
+        assert_eq!(
+            classify_cc_flag("-FC", cl),
+            Some(FlagClass::PreprocessorCaptured)
+        );
+        // no object effect → NoObjectEffect
+        for f in [
+            "-nologo",
+            "-wd4800",
+            "/wd4244",
+            "-FS",
+            "-Gm-",
+            "-external:W0",
+        ] {
+            assert_eq!(
+                classify_cc_flag(f, cl),
+                Some(FlagClass::NoObjectEffect),
+                "{f}"
+            );
+        }
+        // refused (out of scope) → None
+        assert_eq!(classify_cc_flag("-bigobj", cl), None);
+        assert_eq!(classify_cc_flag("-showIncludes", cl), None);
+    }
+
+    #[test]
+    fn clang_cl_full_firefox_invocation_is_cacheable() {
+        // Layer 2 + Layer 4 modeled flags (minus -Z7/-bigobj/-showIncludes).
+        let p = CcArgs::parse(&s(&[
+            "clang-cl",
+            "-c",
+            "foo.c",
+            "-Fofoo.obj",
+            "-std:c++20",
+            "-fms-compatibility-version=19.50",
+            "-guard:cf,nochecks",
+            "-Gy",
+            "-Gw",
+            "-Oy-",
+            "-Zc:inline",
+            "-Zc:wchar_t",
+            "-MD",
+            "-EHs-c-",
+            "-GR-",
+            "-GS-",
+            "-nologo",
+            "-wd4800",
+            "-utf-8",
+            "-FS",
+            "-external:W0",
+            "-Brepro",
+            "-FC",
+        ]))
+        .unwrap();
+        let refuse = p.refuse_reasons(&[]);
+        assert!(
+            refuse.is_empty(),
+            "should cache, refused: {:?}",
+            refuse.iter().map(|r| r.description()).collect::<Vec<_>>()
+        );
+        // -bigobj and -showIncludes still refuse.
+        let big = CcArgs::parse(&s(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-bigobj"])).unwrap();
+        assert!(!big.refuse_reasons(&[]).is_empty());
     }
 }
