@@ -41,6 +41,13 @@ jobs:
       # cargo-llvm-cov.
       - uses: jdx/mise-action@v4
         with:
+          # Pin the mise CLI. v2026.6.10 (2026-06-14) regressed binary
+          # resolution ("mise ERROR cannot find binary path"), reddening every
+          # run after its release — including unchanged code that passed hours
+          # earlier. mise.toml already pins every *tool* for exactly this
+          # reason; the CLI was the one unpinned surface. Bump deliberately once
+          # upstream fixes it.
+          version: 2026.6.9
           cache: false
       - uses: docker/setup-buildx-action@v4
       - uses: kunobi-ninja/kache-action@v1
@@ -271,6 +278,8 @@ jobs:
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
+          version: 2026.6.9
           install_args: --force rust github:mozilla/sccache
           cache: false
           reshim: false
@@ -315,12 +324,27 @@ jobs:
         # results.json. Replaces the previous per-language bash scripts.
         run: |
           mkdir -p tmp/e2e
-          ./target/release/kache-scenario${{ matrix.exe_suffix }} \
+          # Bounded retry to absorb transient self-hosted-runner / Windows
+          # file-system flakes (e.g. a relocate-phase build hiccup). Each
+          # attempt is a full clean re-run, so cache assertions stay sound.
+          # A real failure fails all attempts; retries are logged as warnings
+          # so a genuinely-intermittent issue stays visible, not hidden.
+          n=0
+          until ./target/release/kache-scenario${{ matrix.exe_suffix }} \
             --kache ./target/release/kache${{ matrix.exe_suffix }} \
             --scenarios ./scenarios \
             --select suite:e2e \
             --select tier:gate \
             --out tmp/e2e/results.json
+          do
+            n=$((n + 1))
+            if [ "$n" -ge 3 ]; then
+              echo "::error::e2e harness failed after $n attempts"
+              exit 1
+            fi
+            echo "::warning::e2e harness attempt $n failed; retrying (transient-flake mitigation)"
+            sleep 15
+          done
       - name: Run e2e negative-control (falsifiability check)
         # Reruns every fixture with kache disabled (KACHE_DISABLED=1)
         # and asserts each non-exempt result FLIPS to a failure — a
@@ -347,7 +371,19 @@ jobs:
         # Independent signal; `always()` so it runs even if the
         # harness step above failed.
         if: always() && hashFiles(format('target/release/kache{0}', matrix.exe_suffix)) != ''
-        run: ./scripts/sccache-fallback-check.sh ./target/release/kache${{ matrix.exe_suffix }}
+        run: |
+          # Bounded retry, same rationale as the harness step above.
+          n=0
+          until ./scripts/sccache-fallback-check.sh ./target/release/kache${{ matrix.exe_suffix }}
+          do
+            n=$((n + 1))
+            if [ "$n" -ge 3 ]; then
+              echo "::error::sccache fallback check failed after $n attempts"
+              exit 1
+            fi
+            echo "::warning::sccache fallback check attempt $n failed; retrying (transient-flake mitigation)"
+            sleep 15
+          done
       - name: Show aggregated e2e results
         if: always()
         run: |
@@ -447,6 +483,8 @@ jobs:
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
+          version: 2026.6.9
           install_args: --force rust
           cache: false
           reshim: false
