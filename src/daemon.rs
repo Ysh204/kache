@@ -4097,11 +4097,11 @@ fn wait_for_socket_until(
 
 // ── Tests ────────────────────────────────────────────────────────
 
-// Daemon tests exercise the Unix socket transport directly and are gated to
-// Unix targets. Windows uses a different IPC primitive (named pipes) that
-// will be migrated in a follow-up PR; until then the daemon's RPC paths are
-// no-ops on Windows.
-#[cfg(all(test, unix))]
+// Daemon tests run on every platform via the cross-platform `transport` layer
+// (Unix domain sockets on Unix, named pipes on Windows). The handful of tests
+// that exercise Unix-only semantics directly — socket *files* on disk, POSIX
+// process termination via `sh` — are individually `#[cfg(unix)]`-gated below.
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
@@ -4125,6 +4125,59 @@ mod tests {
     async fn connect_stream(path: &Path) -> TokioStream {
         let name = socket_name(path).expect("socket name");
         TokioStream::connect(name).await.expect("connect")
+    }
+
+    /// Bind a *synchronous* listener at `path` so `transport::is_reachable`
+    /// reports the endpoint as live. Cross-platform (UDS file on Unix, named
+    /// pipe on Windows) and, unlike the tokio listener, needs no async runtime
+    /// — so it can be created inside a plain `std::thread`.
+    fn bind_sync_listener(path: &Path) -> interprocess::local_socket::Listener {
+        let name = socket_name(path).expect("socket name");
+        ListenerOptions::new()
+            .name(name)
+            .create_sync()
+            .expect("create_sync listener")
+    }
+
+    /// Spawn a child that exits immediately with success — a stand-in for a
+    /// daemon-starter process that returns before the socket is ready.
+    fn spawn_quick_exit_child() -> std::process::Child {
+        #[cfg(unix)]
+        {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/c", "exit", "0"])
+                .spawn()
+                .unwrap()
+        }
+    }
+
+    /// Spawn a child that blocks long enough (~30s) to be killed by the code
+    /// under test. `sleep` on Unix; on Windows a 30-ping loop, since `timeout`
+    /// needs a console and fails under captured stdio.
+    fn spawn_blocking_child() -> std::process::Child {
+        #[cfg(unix)]
+        {
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 30"])
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/c", "ping", "-n", "31", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        }
     }
 
     /// Run one client request→response roundtrip against a daemon socket and
@@ -4399,8 +4452,9 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            let _listener = std::os::unix::net::UnixListener::bind(socket_path_bg).unwrap();
+            let listener = bind_sync_listener(&socket_path_bg);
             std::thread::sleep(Duration::from_millis(200));
+            drop(listener);
         });
 
         let ready = wait_for_socket_until(&socket_path, None, Duration::from_secs(1)).unwrap();
@@ -4427,14 +4481,12 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            let _listener = std::os::unix::net::UnixListener::bind(socket_path_bg).unwrap();
+            let listener = bind_sync_listener(&socket_path_bg);
             std::thread::sleep(Duration::from_millis(200));
+            drop(listener);
         });
 
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .unwrap();
+        let mut child = spawn_quick_exit_child();
 
         let ready =
             wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_secs(1)).unwrap();
@@ -4447,10 +4499,7 @@ mod tests {
     fn test_wait_for_socket_until_kills_stuck_child_after_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("missing.sock");
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
+        let mut child = spawn_blocking_child();
 
         let ready =
             wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_millis(150))
@@ -4501,10 +4550,7 @@ mod tests {
         std::fs::write(&socket_path, b"stale").unwrap();
         let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
 
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
+        let mut child = spawn_blocking_child();
 
         let state = DaemonCoordState {
             pid: child.id(),
@@ -4528,10 +4574,7 @@ mod tests {
         std::fs::write(&socket_path, b"stale").unwrap();
         let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
 
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
+        let mut child = spawn_blocking_child();
 
         let state = DaemonCoordState {
             pid: child.id(),
@@ -4555,10 +4598,7 @@ mod tests {
         let socket_path = dir.path().join("daemon.sock");
         std::fs::write(&socket_path, b"stale").unwrap();
 
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
+        let mut child = spawn_blocking_child();
 
         let state = DaemonCoordState {
             pid: child.id(),
@@ -5041,6 +5081,12 @@ mod tests {
         );
     }
 
+    // Unix-only by nature: it asserts that a leftover regular *file* at the
+    // socket path is not a connectable socket and can be removed. Windows uses
+    // named pipes, which leave no on-disk artifact at the path, so there is no
+    // equivalent stale-file scenario to test. (Stale daemon *state* cleanup is
+    // covered cross-platform by test_recover_unhealthy_daemon_cleans_*.)
+    #[cfg(unix)]
     #[test]
     fn test_stale_socket_cleanup() {
         let dir = tempfile::tempdir().unwrap();

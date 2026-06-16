@@ -360,9 +360,12 @@ fn test_wrapper_hello_world() {
 
     assert!(status.success(), "first build with kache should succeed");
 
-    // Verify the binary was produced
+    // Verify the binary was produced (`.exe` on Windows).
     assert!(
-        target_dir.path().join("debug/hello-world").exists(),
+        target_dir
+            .path()
+            .join(format!("debug/hello-world{}", std::env::consts::EXE_SUFFIX))
+            .exists(),
         "binary should be produced"
     );
 
@@ -451,6 +454,11 @@ edition = "2024"
 
 [lib]
 path = "src/lib.rs"
+
+# Standalone workspace root so cargo never walks up into an ancestor workspace
+# (e.g. when the system temp dir lives under one — common on Windows, where
+# %TEMP% is under the user profile).
+[workspace]
 "#,
     )
     .unwrap();
@@ -474,22 +482,29 @@ pub fn value() -> u8 {
     std::fs::remove_dir_all(target_dir.path()).unwrap();
     run_cargo_build_with_kache(project.path(), cache_dir.path(), target_dir.path());
 
-    let (depinfo_path, depinfo) = find_depinfo_containing(target_dir.path(), "src/../README.md")
+    // rustc joins the package-relative dir with the OS separator but keeps the
+    // `include_str!` literal's own slashes verbatim, so the recorded path is
+    // "src/../README.md" on Unix and "src\../README.md" on Windows.
+    let sep = std::path::MAIN_SEPARATOR;
+    let parent_rel = format!("src{sep}../README.md");
+    let (depinfo_path, depinfo) = find_depinfo_containing(target_dir.path(), &parent_rel)
         .expect("restored target dir should contain rustc's parent-relative README.md dep-info");
     assert!(
-        depinfo.contains("src/../README.md"),
+        depinfo.contains(&parent_rel),
         "restored dep-info should preserve rustc's parent-relative include_str path in {}:\n{}",
         depinfo_path.display(),
         depinfo
     );
     assert!(
-        !depinfo.contains("src/./"),
+        !depinfo.contains(&format!("src{sep}./")),
         "restore must not inject the target dir into a parent-relative source path in {}:\n{}",
         depinfo_path.display(),
         depinfo
     );
     assert!(
-        !depinfo.contains("__kache_root__/"),
+        // Match either separator so a leaked sentinel can't slip through on
+        // Windows (`__kache_root__\`).
+        !depinfo.contains("__kache_root__"),
         "restored-facing dep-info must not expose kache sentinels in {}:\n{}",
         depinfo_path.display(),
         depinfo

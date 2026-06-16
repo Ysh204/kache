@@ -257,14 +257,14 @@ impl PathNormalizer {
         );
 
         // De-dupe: if (e.g.) CARGO_HOME == workspace_root, the second
-        // entry would never fire. Also keep order stable so the
-        // first-listed sentinel wins for identical prefixes. Variants
-        // pushed by `push_rule_with_variants` are already adjacent
-        // per-base prefix, so a stable dedup catches duplicates
-        // introduced when (e.g.) `~/.cargo` happens to canonicalize
-        // identically to one of its forward-slash variants on a
-        // unix host (no-op then).
-        rules.dedup_by(|a, b| a.prefix == b.prefix);
+        // entry would never fire. Keep order stable so the first-listed
+        // sentinel wins for identical prefixes. Use a *global* keep-first
+        // dedup rather than `dedup_by` (adjacent-only): two sources that
+        // share a canonical form expand to interleaved variant blocks
+        // (e.g. on Windows `[canon_a, \a]` then `[canon_b, \b]`), so the
+        // duplicate prefixes are not adjacent and `dedup_by` would miss them.
+        let mut seen = std::collections::HashSet::new();
+        rules.retain(|r| seen.insert(r.prefix.clone()));
 
         Self {
             rules,
@@ -554,6 +554,18 @@ fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &
         });
     }
 
+    // Backslash variant — when the canonical arrives in forward-slash form
+    // (e.g. a `CARGO_HOME` set with `/`), rustc/cargo still emit `\` paths, so
+    // the backslash form must be in the rule set too. The `replace('\\', "/")`
+    // above only covers the opposite direction.
+    let bs = prefix.replace('/', "\\");
+    if bs != prefix {
+        rules.push(Rule {
+            prefix: bs.clone(),
+            sentinel,
+        });
+    }
+
     // Lower-case drive variant.
     let lc = lowercase_drive_letter(prefix);
     if let Some(ref lc_str) = lc
@@ -572,6 +584,17 @@ fn push_slash_and_case_variants(rules: &mut Vec<Rule>, prefix: &str, sentinel: &
     {
         rules.push(Rule {
             prefix: fs_lc,
+            sentinel,
+        });
+    }
+
+    // Both: backslash + lower-case drive.
+    if let Some(bs_lc) = lowercase_drive_letter(&bs)
+        && bs_lc != bs
+        && Some(&bs_lc) != lc.as_ref()
+    {
+        rules.push(Rule {
+            prefix: bs_lc,
             sentinel,
         });
     }
@@ -706,7 +729,12 @@ mod tests {
     fn home_rule_normalizes_paths_inside_home() {
         let n = PathNormalizer::from_env(None);
         if let Some(home) = dirs::home_dir().and_then(|p| p.canonicalize().ok()) {
-            let input = format!("{}/some/thing", home.display());
+            // Windows `canonicalize()` yields a `\\?\C:\…` verbatim path; real
+            // cargo/rustc paths don't carry that prefix, so strip it before
+            // building the test input (no-op on Unix).
+            let home = home.display().to_string();
+            let home = home.strip_prefix(r"\\?\").unwrap_or(&home);
+            let input = format!("{home}/some/thing");
             // Either <HOME> or <CARGO_HOME> may match (cargo home is
             // inside home by default). Either is a valid normalization.
             let out = n.normalize(&input);
@@ -981,7 +1009,10 @@ mod tests {
 
         let mut rules = Vec::new();
         push_rule_with_variants(&mut rules, Some(canonical), "<BASE_DIR>");
-        let n = PathNormalizer { rules };
+        let n = PathNormalizer {
+            rules,
+            path_only_env_vars: Vec::new(),
+        };
 
         let input = format!("{short}\\src\\main.rs");
         let out = n.normalize(&input);
@@ -1074,17 +1105,24 @@ mod tests {
         let mut rules = Vec::new();
         push_rule_with_variants(&mut rules, Some("/same/path".to_string()), "<FIRST>");
         push_rule_with_variants(&mut rules, Some("/same/path".to_string()), "<SECOND>");
-        rules.dedup_by(|a, b| a.prefix == b.prefix);
-        // Order preserved — first occurrence wins. Note this exercises
-        // the same dedup the real `from_env` does.
+        // Mirror the real `from_env` global keep-first dedup.
+        let mut seen = std::collections::HashSet::new();
+        rules.retain(|r| seen.insert(r.prefix.clone()));
         let names: Vec<_> = rules_for(&PathNormalizer {
             rules,
             path_only_env_vars: Vec::new(),
         })
         .into_iter()
         .collect();
-        assert_eq!(names.len(), 1);
-        assert_eq!(names[0].1, "<FIRST>");
+        // The SECOND source's prefixes all duplicate the FIRST's, so every
+        // surviving rule comes from FIRST. (Unix: one rule for `/same/path`;
+        // Windows: that plus the backslash variant — all `<FIRST>`.)
+        assert!(!names.is_empty());
+        assert!(names.iter().all(|(_, sentinel)| *sentinel == "<FIRST>"));
+        assert!(names.iter().any(|(prefix, _)| prefix == "/same/path"));
+        // No prefix survives more than once.
+        let unique: std::collections::HashSet<_> = names.iter().map(|(p, _)| p).collect();
+        assert_eq!(unique.len(), names.len());
     }
 
     #[test]
