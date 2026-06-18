@@ -254,14 +254,14 @@ impl Config {
 
         let max_size = std::env::var("KACHE_MAX_SIZE")
             .ok()
-            .and_then(|s| parse_size(&s))
+            .and_then(|s| parse_size_checked(&s, "KACHE_MAX_SIZE"))
             .or_else(|| {
                 file_config
                     .as_ref()
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.local_max_size.as_ref())
-                    .and_then(|s| parse_size(s))
+                    .and_then(|s| parse_size_checked(s, "[cache] local_max_size"))
             })
             .unwrap_or(50 * 1024 * 1024 * 1024); // 50 GiB
 
@@ -292,7 +292,7 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.event_log_max_size.as_ref())
-            .and_then(|s| parse_size(s))
+            .and_then(|s| parse_size_checked(s, "[cache] event_log_max_size"))
             .unwrap_or(10 * 1024 * 1024); // 10 MiB
 
         let event_log_keep_lines = file_config
@@ -760,15 +760,25 @@ fn shellexpand(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn expand_env_vars(s: &str) -> String {
-    expand_env_vars_with(s, |key| std::env::var(key).ok())
-}
-
-fn expand_env_vars_with<F>(s: &str, lookup: F) -> String
+/// Core `$VAR` / `${VAR}` expander. Returns the expanded string plus the names
+/// of every referenced env var that was *unset* (no value and no
+/// [`default_env_var_value`]) and so was left as a literal `$VAR` in the output.
+///
+/// An unset reference matters to cache-key callers: it silently survives as
+/// text that matches nothing, so they fold a replayable pattern-set-only key
+/// while believing the intended files are tracked. Reporting the unset names
+/// lets those callers warn instead of degrading silently.
+fn expand_env_vars_collecting<F>(s: &str, lookup: F) -> (String, Vec<String>)
 where
     F: Fn(&str) -> Option<String>,
 {
     let mut out = String::with_capacity(s.len());
+    let mut unset: Vec<String> = Vec::new();
+    let mut note_unset = |key: &str| {
+        if !unset.iter().any(|k| k == key) {
+            unset.push(key.to_string());
+        }
+    };
     let mut chars = s.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch != '$' {
@@ -788,6 +798,7 @@ where
             if let Some(value) = lookup(&key).or_else(|| default_env_var_value(&key)) {
                 out.push_str(&value);
             } else {
+                note_unset(&key);
                 out.push_str("${");
                 out.push_str(&key);
                 out.push('}');
@@ -809,11 +820,12 @@ where
         } else if let Some(value) = lookup(&key).or_else(|| default_env_var_value(&key)) {
             out.push_str(&value);
         } else {
+            note_unset(&key);
             out.push('$');
             out.push_str(&key);
         }
     }
-    out
+    (out, unset)
 }
 
 fn default_env_var_value(key: &str) -> Option<String> {
@@ -826,9 +838,18 @@ fn default_env_var_value(key: &str) -> Option<String> {
 }
 
 pub(crate) fn expand_exclude_pattern(pattern: &str) -> String {
-    shellexpand(&expand_env_vars(pattern))
-        .to_string_lossy()
-        .into_owned()
+    expand_exclude_pattern_collecting(pattern).0
+}
+
+/// Like [`expand_exclude_pattern`] but also returns the names of env vars that
+/// were referenced (`$VAR` / `${VAR}`) but unset. Such references stay literal
+/// in the returned pattern and match nothing, so a caller folding the pattern
+/// into a cache key warns rather than silently keying on a matches-nothing
+/// pattern. See [`expand_env_vars_collecting`].
+pub(crate) fn expand_exclude_pattern_collecting(pattern: &str) -> (String, Vec<String>) {
+    let (expanded, unset) = expand_env_vars_collecting(pattern, |key| std::env::var(key).ok());
+    let s = shellexpand(&expanded).to_string_lossy().into_owned();
+    (s, unset)
 }
 
 fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -890,6 +911,26 @@ pub(crate) fn parse_size(s: &str) -> Option<u64> {
     s.parse::<ByteSize>().ok().map(|b| b.as_u64())
 }
 
+/// Parse a human size string, warning loudly when it is set but malformed.
+///
+/// A value `ByteSize` can't parse (a typo'd unit like `100 gigs`, digit
+/// grouping like `1_000`, plain garbage) otherwise degrades silently:
+/// `Config::load` falls through to the next source and finally to a hardcoded
+/// default, so the cap the user asked for is ignored without a word. `source`
+/// names where the value came from (e.g. `KACHE_MAX_SIZE`) so the warning
+/// points at the right place.
+pub(crate) fn parse_size_checked(value: &str, source: &str) -> Option<u64> {
+    let parsed = parse_size(value);
+    if parsed.is_none() {
+        tracing::warn!(
+            "ignoring malformed size {value:?} from {source}: expected an integer with an \
+             optional unit like `50GiB`, `512MiB`, or `1000000`; falling back to the next \
+             configured source or the default"
+        );
+    }
+    parsed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,6 +982,21 @@ mod tests {
         assert_eq!(parse_size("50GiB"), Some(50 * 1024 * 1024 * 1024));
         assert_eq!(parse_size("1MiB"), Some(1024 * 1024));
         assert!(parse_size("invalid").is_none());
+    }
+
+    #[test]
+    fn parse_size_checked_rejects_malformed_and_mirrors_parse_size() {
+        // Values ByteSize can't parse: a typo'd unit and digit grouping. These
+        // are exactly what used to silently degrade to the hardcoded default.
+        for bad in ["100 gigs", "1_000", "abc", ""] {
+            assert!(parse_size(bad).is_none(), "expected {bad:?} to be invalid");
+            assert!(parse_size_checked(bad, "KACHE_MAX_SIZE").is_none());
+        }
+        // Valid values pass through unchanged.
+        assert_eq!(
+            parse_size_checked("2GiB", "KACHE_MAX_SIZE"),
+            Some(2 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]
@@ -1257,11 +1313,37 @@ mod tests {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let cargo_home = home.join(".cargo").to_string_lossy().into_owned();
 
-        let expanded = expand_env_vars_with("$CARGO_HOME/registry/src/**", |_| None);
+        let (expanded, _) = expand_env_vars_collecting("$CARGO_HOME/registry/src/**", |_| None);
         assert_eq!(expanded, format!("{cargo_home}/registry/src/**"));
 
-        let expanded_braced = expand_env_vars_with("${CARGO_HOME}/registry/src/**", |_| None);
+        let (expanded_braced, _) =
+            expand_env_vars_collecting("${CARGO_HOME}/registry/src/**", |_| None);
         assert_eq!(expanded_braced, format!("{cargo_home}/registry/src/**"));
+    }
+
+    #[test]
+    fn expand_collecting_reports_unset_vars_only_once() {
+        let (expanded, unset) =
+            expand_env_vars_collecting("$MISSING/$MISSING/${ALSO_MISSING}/x", |_| None);
+        // Unset refs stay literal so the caller can see they matched nothing.
+        assert_eq!(expanded, "$MISSING/$MISSING/${ALSO_MISSING}/x");
+        // Deduplicated, in first-seen order.
+        assert_eq!(
+            unset,
+            vec!["MISSING".to_string(), "ALSO_MISSING".to_string()]
+        );
+    }
+
+    #[test]
+    fn expand_collecting_no_unset_when_resolved_or_defaulted() {
+        let (expanded, unset) =
+            expand_env_vars_collecting("$FOO/x", |k| (k == "FOO").then(|| "bar".to_string()));
+        assert_eq!(expanded, "bar/x");
+        assert!(unset.is_empty());
+
+        // CARGO_HOME has a built-in default, so it is not reported as unset.
+        let (_, unset_default) = expand_env_vars_collecting("$CARGO_HOME/x", |_| None);
+        assert!(unset_default.is_empty());
     }
 
     #[test]
