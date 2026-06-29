@@ -673,6 +673,11 @@ pub fn compute_cache_key(
     // cross-machine stability). Order is preserved — link order is
     // significant, and a stable argv from cargo keeps the key stable.
     const KNOWN_L_KINDS: [&str; 5] = ["dependency", "crate", "native", "framework", "all"];
+    // Real (un-normalized) build-script search dirs, kept for resolving `-l`
+    // static libs to a content hash below (#421). `native=`/bare entries are the
+    // OUT_DIR dirs a `cc`/`cmake` build script emits; `dependency=`/`crate=` are
+    // cargo's own rlib dirs (redundant with content-hashed externs).
+    let mut native_search_dirs: Vec<PathBuf> = Vec::new();
     for spec in &args.link_search {
         // Only split on a *recognized* kind so a path containing '='
         // isn't mis-parsed (matches rustc's own `-L` parsing).
@@ -682,6 +687,11 @@ pub fn compute_cache_key(
         };
         if matches!(kind, Some("dependency") | Some("crate")) {
             continue;
+        }
+        // `all=` and bare/`native=` dirs all search native libs (rustc's `-L`
+        // default kind is `all`); a `static=` lib can resolve in any of them.
+        if matches!(kind, None | Some("native") | Some("all")) {
+            native_search_dirs.push(PathBuf::from(path));
         }
         let normalized = path_normalizer.normalize(path);
         hasher.update(b"link_search:");
@@ -694,15 +704,41 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] link_search:{}", crate_name, normalized);
     }
 
-    // Native libraries to link (`-l`). Machine-independent names; a
-    // build script repointing these (e.g. linking a different `libfoo`)
-    // changes the linked binary without touching RUSTFLAGS. Hashed raw,
-    // order preserved (static link order is significant).
+    // Native libraries to link (`-l`). The name alone (machine-independent;
+    // a build script repointing `-l` to a different lib is caught here) is
+    // hashed raw, order preserved (static link order is significant).
+    //
+    // The name does NOT capture a `static=` lib whose *content* changed in
+    // place — same `-l` name, same `-L` path, different bytes. rustc bundles a
+    // `static=` archive INTO the produced rlib/binary, so its bytes are part of
+    // the output: an unchanged key there is a stale-artifact false hit (#421).
+    // Resolve each `static=` lib against the kept build-script search dirs and
+    // fold its content hash. Phase 1 is deliberately narrow — only `static=`
+    // (the bundled, output-affecting case) and only build-script `native=`/bare
+    // dirs (the OUT_DIR false-hit trigger). `dylib=` is referenced, not bundled,
+    // so its content does not change this output and is left name-only; an
+    // unresolved lib (system libs, custom layouts) also falls back to name-only,
+    // never a false hit.
     for lib in &args.link_libs {
         hasher.update(b"link_lib:");
         hasher.update(lib.as_bytes());
         hasher.update(b"\n");
         tracing::trace!("[key:{}] link_lib:{}", crate_name, lib);
+
+        if let Some((path, content_hash)) =
+            resolve_native_static_lib(lib, &native_search_dirs, file_hasher)
+        {
+            hasher.update(b"link_lib_content:");
+            hasher.update(content_hash.as_bytes());
+            hasher.update(b"\n");
+            tracing::trace!(
+                "[key:{}] link_lib_content:{}={} ({})",
+                crate_name,
+                lib,
+                &content_hash[..content_hash.len().min(16)],
+                path.display()
+            );
+        }
     }
 
     // Unstable `-Z` flags arriving on argv outside RUSTFLAGS. Can change
@@ -944,6 +980,61 @@ fn lexically_resolve_path(input: &str) -> String {
         (false, true) => anchor,
         (false, false) => format!("{anchor}{joined}"),
     }
+}
+
+/// Resolve a `-l` spec to a plain `static=` archive in one of the build-script
+/// search dirs and return `(path, content_hash)`, or `None` when it is not a
+/// clean `static=NAME`, cannot be located unambiguously, or cannot be read.
+/// Used to fold a native static lib's content into the cache key so an in-place
+/// rebuild of `lib<name>.a` (same name, same path, changed bytes) no longer
+/// produces a stale hit (#421). Phase 1 is intentionally narrow — see the `-l`
+/// loop in [`compute_cache_key`].
+fn resolve_native_static_lib(
+    spec: &str,
+    search_dirs: &[PathBuf],
+    file_hasher: &FileHasher<'_>,
+) -> Option<(PathBuf, String)> {
+    let name = clean_static_lib_name(spec)?;
+    // Probe the common platform conventions by existence (host-agnostic; the
+    // file only exists where the build produced it). If more than one candidate
+    // matches — `lib<name>.a` and `<name>.lib`, or hits in two dirs — the choice
+    // is ambiguous (rustc's pick is target-specific), so fall back to name-only
+    // rather than risk hashing the wrong file.
+    let mut found: Option<PathBuf> = None;
+    for dir in search_dirs {
+        for filename in [format!("lib{name}.a"), format!("{name}.lib")] {
+            let candidate = dir.join(&filename);
+            if candidate.is_file() {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(candidate);
+            }
+        }
+    }
+    let path = found?;
+    let hash = file_hasher.hash(&path).ok()?;
+    Some((path, hash))
+}
+
+/// `Some(name)` only for a plain `static=NAME` with no kind modifiers and no
+/// `:RENAME`. Anything fancier is returned as `None` so the caller falls back to
+/// name-only rather than mis-resolve or over-key:
+/// - `static:+verbatim=` / `static:-bundle=` etc. — modifiers change whether the
+///   archive is bundled into the output and how the name maps to a file;
+/// - `static=foo:bar` — a `:RENAME` form whose linked file is not simply `foo`;
+/// - `dylib=` / bare `-l name` — referenced, not bundled, so content must not
+///   key the consumer.
+fn clean_static_lib_name(spec: &str) -> Option<&str> {
+    let (kind, name) = spec.split_once('=')?;
+    // Exactly `static`: a modifier suffix (`static:+bundle`) makes `kind != "static"`.
+    if kind != "static" {
+        return None;
+    }
+    if name.is_empty() || name.contains(':') {
+        return None;
+    }
+    Some(name)
 }
 
 fn normalize_env_dep_value(
@@ -2469,6 +2560,126 @@ mod tests {
         assert_ne!(ssl, crypto, "a different -l lib must change the key");
         // Attached form parses identically to the separate form.
         assert_eq!(ssl, key_of(&flag_base(&source, &["-lssl"])));
+    }
+
+    #[test]
+    fn clean_static_lib_name_accepts_only_plain_static() {
+        assert_eq!(clean_static_lib_name("static=foo"), Some("foo"));
+        // Modifiers, a :RENAME, other kinds, and bare names are all rejected so
+        // the caller falls back to name-only rather than mis-resolve / over-key.
+        assert_eq!(clean_static_lib_name("static:+verbatim=foo"), None);
+        assert_eq!(clean_static_lib_name("static:-bundle=foo"), None);
+        assert_eq!(clean_static_lib_name("static=foo:bar"), None);
+        assert_eq!(clean_static_lib_name("dylib=foo"), None);
+        assert_eq!(clean_static_lib_name("foo"), None);
+        assert_eq!(clean_static_lib_name("static="), None);
+    }
+
+    #[test]
+    fn resolve_native_static_lib_hashes_only_unambiguous_static_archives() {
+        let fh = FileHasher::new();
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("libfoo.a");
+        std::fs::write(&lib, b"v1 archive bytes").unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+
+        // A `static=` lib present in a search dir resolves and content-hashes.
+        let (path, h1) = resolve_native_static_lib("static=foo", &dirs, &fh)
+            .expect("static lib in a search dir must resolve");
+        assert_eq!(path, lib);
+
+        // Changed bytes → different hash (this is the false hit we close).
+        std::fs::write(&lib, b"v2 different bytes").unwrap();
+        let (_, h2) = resolve_native_static_lib("static=foo", &dirs, &fh).unwrap();
+        assert_ne!(h1, h2, "content change must change the resolved hash");
+
+        // `dylib=`/bare are referenced not bundled → never content-hashed; a
+        // missing lib and a modifier/rename spec also do not resolve.
+        assert!(resolve_native_static_lib("dylib=foo", &dirs, &fh).is_none());
+        assert!(resolve_native_static_lib("foo", &dirs, &fh).is_none());
+        assert!(resolve_native_static_lib("static:+verbatim=foo", &dirs, &fh).is_none());
+        assert!(resolve_native_static_lib("static=absent", &dirs, &fh).is_none());
+
+        // Ambiguous match (both `libfoo.a` and `foo.lib` present) → name-only,
+        // so we never hash a file rustc might not have picked.
+        std::fs::write(dir.path().join("foo.lib"), b"msvc import lib").unwrap();
+        assert!(
+            resolve_native_static_lib("static=foo", &dirs, &fh).is_none(),
+            "ambiguous .a/.lib match must fall back to name-only"
+        );
+    }
+
+    /// The cardinal #421 false hit: a `static=` native lib whose content changes
+    /// in place (same `-l` name, same normalized `-L` path) must change the key.
+    #[test]
+    fn native_static_lib_content_change_changes_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let lib = libdir.join("libfoo.a");
+        std::fs::write(&lib, b"v1 archive bytes").unwrap();
+        let search = format!("native={}", libdir.display());
+        let flags = ["-L", search.as_str(), "-l", "static=foo"];
+
+        let k1 = key_of(&flag_base(&source, &flags));
+        std::fs::write(&lib, b"v2 archive bytes - DIFFERENT").unwrap();
+        let k2 = key_of(&flag_base(&source, &flags));
+        assert_ne!(
+            k1, k2,
+            "a native static lib content change must change the key (#421)"
+        );
+        // Content-addressed: the original bytes reproduce the original key.
+        std::fs::write(&lib, b"v1 archive bytes").unwrap();
+        let k3 = key_of(&flag_base(&source, &flags));
+        assert_eq!(k1, k3, "identical bytes must reproduce the key");
+    }
+
+    /// A `dylib=` lib is referenced at runtime, not bundled into the output, so
+    /// its content must NOT enter the key (guards against over-keying).
+    #[test]
+    fn native_dylib_content_does_not_change_key() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let lib = libdir.join("libfoo.so");
+        std::fs::write(&lib, b"so v1").unwrap();
+        let search = format!("native={}", libdir.display());
+        let flags = ["-L", search.as_str(), "-l", "dylib=foo"];
+
+        let k1 = key_of(&flag_base(&source, &flags));
+        std::fs::write(&lib, b"so v2 changed").unwrap();
+        let k2 = key_of(&flag_base(&source, &flags));
+        assert_eq!(k1, k2, "a dynamic lib's content must not key the consumer");
+    }
+
+    /// rustc's default `-L` kind is `all`, which searches native libs too, so a
+    /// `static=` lib found under `-L all=<dir>` must be content-keyed (#421).
+    #[test]
+    fn native_static_lib_in_all_search_dir_is_keyed() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let lib = libdir.join("libfoo.a");
+        std::fs::write(&lib, b"v1 archive bytes").unwrap();
+        let search = format!("all={}", libdir.display());
+        let flags = ["-L", search.as_str(), "-l", "static=foo"];
+
+        let k1 = key_of(&flag_base(&source, &flags));
+        std::fs::write(&lib, b"v2 archive bytes - DIFFERENT").unwrap();
+        let k2 = key_of(&flag_base(&source, &flags));
+        assert_ne!(
+            k1, k2,
+            "a static lib under `-L all=` must be content-keyed too (#421)"
+        );
     }
 
     /// kunobi-ninja/kache#324: an unmodeled argv flag that can affect codegen
