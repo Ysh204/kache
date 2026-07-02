@@ -115,6 +115,13 @@ impl Compiler for RustcCompiler {
         let workspace_root = parsed.workspace_root();
         let path_normalizer =
             crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref());
+        // Skip `--remap-path-prefix` injection under coverage instrumentation
+        // (llvm-cov / tarpaulin need real paths in the profraw) OR when the user
+        // opts out via `KACHE_RUSTC_PATH_NORMALIZE=0` for local profiler /
+        // debugger source lookup (kunobi-ninja/kache#480). `skip_path_remap`
+        // is the SAME decision `compute_cache_key` folds into the key, so the
+        // key always reflects the binary that is actually produced.
+        let skip_remap = parsed.skip_path_remap();
         compile::run_rustc(
             &parsed.rustc,
             parsed.inner_rustc.as_deref(),
@@ -123,7 +130,7 @@ impl Compiler for RustcCompiler {
             parsed.out_dir.as_deref(),
             parsed.crate_name.as_deref(),
             parsed.extra_filename.as_deref(),
-            parsed.has_coverage_instrumentation(),
+            skip_remap,
             &path_normalizer,
         )
     }
