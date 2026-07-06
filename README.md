@@ -307,7 +307,3 @@ When combining HA with PVC-backed planner state, use storage that can be mounted
 ## Contributing
 
 Bug reports, feature ideas, and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup, coding conventions, and PR process. To report a security vulnerability privately, follow [SECURITY.md](SECURITY.md).
-
-## Project activity
-
-[![Star History Chart](https://api.star-history.com/chart?repos=kunobi-ninja/kache&type=date&legend=top-left)](https://www.star-history.com/?repos=kunobi-ninja%2Fkache&type=date&legend=top-left)
