@@ -1844,52 +1844,61 @@ pub fn doctor(
         fix: if bin_pass {
             None
         } else {
-            Some("cargo install --path . or add ~/.cargo/bin to PATH".into())
+            Some(format!(
+                "cargo install --path . or add {} to PATH",
+                cargo_home_dir().join("bin").display()
+            ))
         },
     });
 
     // 2. RUSTC_WRAPPER
-    let (wrapper_pass, wrapper_detail, wrapper_fix) = match crate::wrapper_config::resolve_wrapper_setting() {
-        Some(crate::wrapper_config::WrapperSetting::Environment { value }) if value.contains("kache") => {
-            (true, "kache via env".into(), None)
-        }
-        Some(crate::wrapper_config::WrapperSetting::Environment { value })
-            if value.contains("sccache") =>
-        {
-            (
+    let (wrapper_pass, wrapper_detail, wrapper_fix) =
+        match crate::wrapper_config::resolve_wrapper_setting() {
+            Some(crate::wrapper_config::WrapperSetting::Environment { value })
+                if value.contains("kache") =>
+            {
+                (true, "kache via env".into(), None)
+            }
+            Some(crate::wrapper_config::WrapperSetting::Environment { value })
+                if value.contains("sccache") =>
+            {
+                (
+                    false,
+                    format!("sccache ({value})"),
+                    Some("export RUSTC_WRAPPER=kache".into()),
+                )
+            }
+            Some(crate::wrapper_config::WrapperSetting::Environment { value }) => (
                 false,
-                format!("sccache ({value})"),
+                format!("{value} (not kache)"),
                 Some("export RUSTC_WRAPPER=kache".into()),
-            )
-        }
-        Some(crate::wrapper_config::WrapperSetting::Environment { value }) => (
-            false,
-            format!("{value} (not kache)"),
-            Some("export RUSTC_WRAPPER=kache".into()),
-        ),
-        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
-            if value.contains("kache") =>
-        {
-            (
-                true,
-                format!("kache via {}", crate::wrapper_config::display_path(&path)),
-                None,
-            )
-        }
-        Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => (
-            false,
-            format!("{value} in {}", crate::wrapper_config::display_path(&path)),
-            Some(format!(
-                "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
-                path.display()
-            )),
-        ),
-        None => (
-            false,
-            "not set".into(),
-            Some("set `build.rustc-wrapper = \"kache\"` in ~/.cargo/config.toml or export RUSTC_WRAPPER=kache".into()),
-        ),
-    };
+            ),
+            Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path })
+                if value.contains("kache") =>
+            {
+                (
+                    true,
+                    format!("kache via {}", crate::wrapper_config::display_path(&path)),
+                    None,
+                )
+            }
+            Some(crate::wrapper_config::WrapperSetting::CargoConfig { value, path }) => (
+                false,
+                format!("{value} in {}", crate::wrapper_config::display_path(&path)),
+                Some(format!(
+                    "replace `rustc-wrapper = \"{value}\"` with `rustc-wrapper = \"kache\"` in {}",
+                    path.display()
+                )),
+            ),
+            None => (
+                false,
+                "not set".into(),
+                Some(format!(
+                    "set `build.rustc-wrapper = \"kache\"` in {} or export RUSTC_WRAPPER=kache",
+                    cargo_config_target_path().display()
+                )),
+            ),
+        };
     checks.push(Check {
         label: "RUSTC_WRAPPER",
         pass: wrapper_pass,
@@ -2339,9 +2348,10 @@ fn migrate(purge_sccache: bool) -> Result<()> {
         actions.push("Stopped sccache daemon".into());
     }
 
-    // 2. Replace sccache in ~/.cargo/config.toml
+    // 2. Replace sccache in $CARGO_HOME/config.toml (fallback to ~/.cargo)
+    let cargo_dir = cargo_home_dir();
     for name in ["config.toml", "config"] {
-        let cargo_config = home.join(".cargo").join(name);
+        let cargo_config = cargo_dir.join(name);
         if let Ok(content) = std::fs::read_to_string(&cargo_config)
             && content.contains("sccache")
         {
@@ -2391,11 +2401,19 @@ fn migrate(purge_sccache: bool) -> Result<()> {
         }
 
         // Uninstall sccache binary if cargo-installed
-        if let Ok(output) = std::process::Command::new("which").arg("sccache").output()
+        if let Ok(output) =
+            std::process::Command::new(if cfg!(windows) { "where" } else { "which" })
+                .arg("sccache")
+                .output()
             && output.status.success()
         {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if path.contains(".cargo/bin") {
+            let sccache_path = std::path::PathBuf::from(&path);
+            let cargo_bin = cargo_dir.join("bin");
+            let resolved_sccache = sccache_path.canonicalize().unwrap_or(sccache_path);
+            let resolved_cargo_bin = cargo_bin.canonicalize().unwrap_or(cargo_bin);
+
+            if resolved_sccache.starts_with(resolved_cargo_bin) {
                 println!("Uninstalling sccache via cargo...");
                 let status = std::process::Command::new("cargo")
                     .args(["uninstall", "sccache"])
@@ -5660,7 +5678,8 @@ mod tests {
 // ── Init ──────────────────────────────────────────────────────────────────
 //
 // Interactive setup that resolves the common doctor issues:
-//   1. Writes `build.rustc-wrapper = "kache"` to ~/.cargo/config.toml
+//   1. Writes `build.rustc-wrapper = "kache"` to $CARGO_HOME/config.toml
+//      (fallback to ~/.cargo/config.toml)
 //   2. Installs the daemon as a login service (launchd/systemd)
 //   3. Starts the daemon
 //
@@ -5784,9 +5803,22 @@ fn backup_path_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(path.with_file_name(format!("{file_name}.kache-backup.{timestamp}")))
 }
 
+/// `$CARGO_HOME`, falling back to `~/.cargo` (cargo's documented default).
+fn cargo_home_dir() -> std::path::PathBuf {
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME").filter(|value| !value.is_empty()) {
+        let cargo_home = std::path::PathBuf::from(cargo_home);
+        if cargo_home.is_absolute() {
+            cargo_home
+        } else {
+            std::env::current_dir().unwrap_or_default().join(cargo_home)
+        }
+    } else {
+        dirs::home_dir().unwrap_or_default().join(".cargo")
+    }
+}
+
 fn cargo_config_target_path() -> std::path::PathBuf {
-    let home = dirs::home_dir().unwrap_or_default();
-    let cargo_dir = home.join(".cargo");
+    let cargo_dir = cargo_home_dir();
     let with_ext = cargo_dir.join("config.toml");
     let legacy = cargo_dir.join("config");
     // Prefer the file that already exists; fall back to the canonical name.
