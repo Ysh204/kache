@@ -2530,8 +2530,8 @@ impl Daemon {
                 });
             }
         };
-        let (dedup_stats, evict_stats, incremental_cleaned, orphan_stats) =
-            self.with_store(|store| {
+        let (dedup_stats, worktree_stats, evict_stats, incremental_cleaned, orphan_stats) = self
+            .with_store(|store| {
                 // Backfill content_hash for legacy entries
                 let backfilled = store.backfill_content_hashes().unwrap_or(0);
                 if backfilled > 0 {
@@ -2542,6 +2542,15 @@ impl Daemon {
                 let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
                 if dedup_stats.entries_evicted > 0 {
                     tracing::info!("evicted {} duplicate entries", dedup_stats.entries_evicted);
+                }
+
+                let worktree_stats = store.reclaim_orphaned_worktree_entries()?;
+                if worktree_stats.entries_evicted > 0 {
+                    tracing::info!(
+                        "reclaimed {} entries from deleted worktrees ({} freed)",
+                        worktree_stats.entries_evicted,
+                        crate::report::format_bytes(worktree_stats.bytes_freed)
+                    );
                 }
 
                 let evict_stats = if let Some(hours) = max_age_hours {
@@ -2572,7 +2581,13 @@ impl Daemon {
                     );
                 }
 
-                Ok((dedup_stats, evict_stats, incremental_cleaned, orphan_stats))
+                Ok((
+                    dedup_stats,
+                    worktree_stats,
+                    evict_stats,
+                    incremental_cleaned,
+                    orphan_stats,
+                ))
             })?;
 
         // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
@@ -2585,8 +2600,11 @@ impl Daemon {
 
         // Aggregate stats
         let stats = crate::store::GcStats {
-            entries_evicted: dedup_stats.entries_evicted + evict_stats.entries_evicted,
+            entries_evicted: dedup_stats.entries_evicted
+                + worktree_stats.entries_evicted
+                + evict_stats.entries_evicted,
             bytes_freed: dedup_stats.bytes_freed
+                + worktree_stats.bytes_freed
                 + evict_stats.bytes_freed
                 + orphan_stats.bytes_reclaimed,
             blobs_removed: dedup_stats.blobs_removed
@@ -4887,6 +4905,9 @@ mod tests {
             disabled: false,
             cache_executables: false,
             clean_incremental: false,
+            reclaim_orphaned_worktrees: false,
+            worktree_reclaim_roots: Vec::new(),
+            worktree_reclaim_grace_secs: 24 * 60 * 60,
             event_log_max_size: 10 * 1024 * 1024,
             event_log_keep_lines: 1000,
             compression_level: 3,

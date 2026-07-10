@@ -506,6 +506,7 @@ fn fields_to_file_config(
             key_salt: get("key_salt"),
             path_only_env_vars: preserved_path_only_env_vars,
             remote,
+            ..Default::default()
         }),
     }
 }
@@ -1194,6 +1195,9 @@ mod tests {
                 }),
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
+                reclaim_orphaned_worktrees: None,
+                worktree_reclaim_roots: None,
+                worktree_reclaim_grace_secs: None,
                 exclude: Some(vec![
                     "src/generated/**".to_string(),
                     "vendor/**".to_string(),

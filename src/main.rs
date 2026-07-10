@@ -432,7 +432,7 @@ fn main() -> Result<()> {
             cli::gc(&config, hours)
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
-        Some(Commands::Clean { dry_run, yes }) => cli::clean(dry_run, yes),
+        Some(Commands::Clean { dry_run, yes }) => cli::clean(&config, dry_run, yes),
         Some(Commands::Init {
             yes,
             no_service,

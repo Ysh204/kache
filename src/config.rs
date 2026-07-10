@@ -15,6 +15,10 @@ pub struct Config {
     pub disabled: bool,
     pub cache_executables: bool,
     pub clean_incremental: bool,
+    /// Reclaim cache entries produced by git worktrees that no longer exist.
+    pub reclaim_orphaned_worktrees: bool,
+    pub worktree_reclaim_roots: Vec<PathBuf>,
+    pub worktree_reclaim_grace_secs: u64,
     pub event_log_max_size: u64,
     pub event_log_keep_lines: usize,
     /// Zstd compression level (1-19, default 3). Lower = faster, higher = smaller.
@@ -159,6 +163,9 @@ pub(crate) struct CacheFileConfig {
     pub(crate) ignore_env: Option<bool>,
     pub(crate) cache_executables: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
+    pub(crate) reclaim_orphaned_worktrees: Option<bool>,
+    pub(crate) worktree_reclaim_roots: Option<Vec<String>>,
+    pub(crate) worktree_reclaim_grace_secs: Option<u64>,
     pub(crate) exclude: Option<Vec<String>>,
     pub(crate) event_log_max_size: Option<String>,
     pub(crate) event_log_keep_lines: Option<usize>,
@@ -264,6 +271,14 @@ fn normalize_cc_flags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
     out
 }
 
+fn parse_path_list(raw: &str) -> Vec<PathBuf> {
+    raw.split([',', ';'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(shellexpand)
+        .collect()
+}
+
 /// The `KACHE_*` env vars suppressed by `[cache] ignore_env`: every file-backed
 /// setting. Deliberately excludes bootstrap/operational vars that have no file
 /// representation — `KACHE_CONFIG` (locates the file itself), `KACHE_DISABLED`
@@ -285,6 +300,9 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_KEY_SALT",
     "KACHE_CC_EXTRA_ALLOWLIST_FLAGS",
     "KACHE_PATH_ONLY_ENV_VARS",
+    "KACHE_RECLAIM_ORPHANED_WORKTREES",
+    "KACHE_WORKTREE_RECLAIM_ROOTS",
+    "KACHE_WORKTREE_RECLAIM_GRACE_SECS",
     "KACHE_S3_BUCKET",
     "KACHE_S3_ENDPOINT",
     "KACHE_S3_REGION",
@@ -518,6 +536,33 @@ impl Config {
                 .unwrap_or_default(),
         };
 
+        let reclaim_orphaned_worktrees = Self::reclaim_orphaned_worktrees_enabled(&file_config);
+        let worktree_reclaim_roots =
+            match env_or_ignored("KACHE_WORKTREE_RECLAIM_ROOTS", ignore_env) {
+                Ok(val) => parse_path_list(&val),
+                Err(_) => file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.worktree_reclaim_roots.clone())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| shellexpand(&s))
+                    .collect(),
+            };
+        let worktree_reclaim_grace_secs =
+            env_or_ignored("KACHE_WORKTREE_RECLAIM_GRACE_SECS", ignore_env)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.worktree_reclaim_grace_secs)
+                })
+                .unwrap_or(24 * 60 * 60);
+
         // Strict local-only mode (#221): suppress all remote config at the
         // source so every consumer that treats `remote = None` as "no remote"
         // becomes a clean no-op — no S3 client, no uploads, no remote checks.
@@ -543,6 +588,9 @@ impl Config {
             windows_hardlink,
             cache_executables,
             clean_incremental,
+            reclaim_orphaned_worktrees,
+            worktree_reclaim_roots,
+            worktree_reclaim_grace_secs,
             event_log_max_size,
             event_log_keep_lines,
             compression_level,
@@ -743,6 +791,19 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.windows_hardlink)
+            .unwrap_or(false)
+    }
+
+    fn reclaim_orphaned_worktrees_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_RECLAIM_ORPHANED_WORKTREES", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.reclaim_orphaned_worktrees)
             .unwrap_or(false)
     }
 
@@ -1264,6 +1325,9 @@ mod tests {
                 planner: None,
                 cache_executables: Some(true),
                 clean_incremental: Some(false),
+                reclaim_orphaned_worktrees: None,
+                worktree_reclaim_roots: None,
+                worktree_reclaim_grace_secs: None,
                 exclude: Some(vec!["vendor/problem/**".to_string()]),
                 event_log_max_size: Some("10MiB".to_string()),
                 event_log_keep_lines: Some(500),
@@ -1440,6 +1504,9 @@ mod tests {
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            reclaim_orphaned_worktrees: false,
+            worktree_reclaim_roots: Vec::new(),
+            worktree_reclaim_grace_secs: 24 * 60 * 60,
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
@@ -1467,6 +1534,9 @@ mod tests {
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            reclaim_orphaned_worktrees: false,
+            worktree_reclaim_roots: Vec::new(),
+            worktree_reclaim_grace_secs: 24 * 60 * 60,
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
@@ -1494,6 +1564,9 @@ mod tests {
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            reclaim_orphaned_worktrees: false,
+            worktree_reclaim_roots: Vec::new(),
+            worktree_reclaim_grace_secs: 24 * 60 * 60,
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
@@ -1524,6 +1597,9 @@ mod tests {
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            reclaim_orphaned_worktrees: false,
+            worktree_reclaim_roots: Vec::new(),
+            worktree_reclaim_grace_secs: 24 * 60 * 60,
             event_log_max_size: 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
@@ -1715,6 +1791,9 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 planner: None,
                 cache_executables: Some(true),
                 clean_incremental: None,
+                reclaim_orphaned_worktrees: None,
+                worktree_reclaim_roots: None,
+                worktree_reclaim_grace_secs: None,
                 exclude: None,
                 event_log_max_size: None,
                 event_log_keep_lines: None,

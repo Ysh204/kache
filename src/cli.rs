@@ -1250,6 +1250,19 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
                 println!(" no duplicates found.");
             }
 
+            print!("Reclaiming deleted worktrees...");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            let worktree_stats = store.reclaim_orphaned_worktree_entries()?;
+            if worktree_stats.entries_evicted > 0 {
+                println!(
+                    " removed {} entries ({}).",
+                    worktree_stats.entries_evicted,
+                    ByteSize(worktree_stats.bytes_freed)
+                );
+            } else {
+                println!(" no orphaned worktrees found.");
+            }
+
             // Size/age-based eviction
             print!("Running eviction...");
             std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -1491,7 +1504,7 @@ fn draw_clean(
 }
 
 /// Recursively find and remove target/ directories (TUI selector).
-pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
+pub fn clean(config: &Config, dry_run: bool, yes: bool) -> Result<()> {
     use crossterm::ExecutableCommand;
     use crossterm::event::{self, Event, KeyEventKind};
     use crossterm::terminal::{
@@ -1507,6 +1520,9 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
 
     if targets.is_empty() {
         println!("No target/ directories found.");
+        if !dry_run {
+            reclaim_deleted_worktrees_for_clean(config)?;
+        }
         return Ok(());
     }
 
@@ -1530,6 +1546,9 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
             "\nRemoved {removed} target/ dirs, freed {}",
             ByteSize(freed)
         );
+        if config.reclaim_orphaned_worktrees {
+            reclaim_deleted_worktrees_for_clean(config)?;
+        }
         return Ok(());
     }
 
@@ -1583,6 +1602,9 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
                 "\nRemoved {removed} target/ dirs, freed {}",
                 ByteSize(freed)
             );
+            if config.reclaim_orphaned_worktrees {
+                reclaim_deleted_worktrees_for_clean(config)?;
+            }
         }
     }
 
@@ -1611,6 +1633,23 @@ fn remove_targets(to_remove: &[(std::path::PathBuf, u64)], root: &std::path::Pat
         }
     }
     (removed, freed)
+}
+
+fn reclaim_deleted_worktrees_for_clean(config: &Config) -> Result<()> {
+    if !config.reclaim_orphaned_worktrees {
+        return Ok(());
+    }
+
+    let store = Store::open(config)?;
+    let stats = store.reclaim_orphaned_worktree_entries()?;
+    if stats.entries_evicted > 0 {
+        println!(
+            "Reclaimed {} stale cache entries from deleted worktrees ({}).",
+            stats.entries_evicted,
+            ByteSize(stats.bytes_freed)
+        );
+    }
+    Ok(())
 }
 
 fn render_clean_dry_run(targets: &[TargetEntry], root: &std::path::Path) -> Vec<String> {
@@ -4325,6 +4364,9 @@ mod tests {
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            reclaim_orphaned_worktrees: false,
+            worktree_reclaim_roots: Vec::new(),
+            worktree_reclaim_grace_secs: 24 * 60 * 60,
             event_log_max_size: 1024 * 1024,
             event_log_keep_lines: 1000,
             compression_level: 3,

@@ -319,6 +319,14 @@ pub struct GcStats {
     pub skipped: bool,
 }
 
+/// Statistics returned by [`Store::reclaim_orphaned_worktree_entries`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorktreeReclaimStats {
+    pub candidates: usize,
+    pub entries_evicted: usize,
+    pub bytes_freed: u64,
+}
+
 /// Statistics returned by [`Store::sweep_orphan_blobs`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OrphanSweepStats {
@@ -519,6 +527,30 @@ fn compute_content_hash(files: &[CachedFile]) -> String {
     h.finalize().to_hex().to_string()
 }
 
+fn detect_origin_worktree() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(canonicalize_existing_dir(&dir));
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn canonicalize_existing_dir(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.is_empty()
+        || roots.iter().any(|root| {
+            let root = canonicalize_existing_dir(root);
+            path.starts_with(root)
+        })
+}
+
 const STORE_OPEN_MAX_ATTEMPTS: u32 = 6;
 const STORE_OPEN_RETRY_DELAYS_MS: [u64; 5] = [25, 50, 100, 200, 250];
 
@@ -565,6 +597,7 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     let _ =
         db.execute_batch("ALTER TABLE entries ADD COLUMN num_features INTEGER NOT NULL DEFAULT 0");
     let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN content_hash TEXT");
+    let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN origin_worktree TEXT");
 
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS blobs (
@@ -1083,6 +1116,8 @@ impl Store {
         }
 
         let content_hash = compute_content_hash(&cached_files);
+        let origin_worktree =
+            detect_origin_worktree().map(|path| path.to_string_lossy().into_owned());
 
         // Record which rustc `--emit` kinds this entry actually contains, derived
         // from the stored output files (kunobi-ninja/kache#325). Lookup rejects an
@@ -1141,8 +1176,8 @@ impl Store {
             materialize_blob(source, &self.blob_path(&file.hash), &file.hash)?;
         }
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
-            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, origin_worktree, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, origin_worktree],
         )?;
         tx.commit()?;
 
@@ -1592,6 +1627,68 @@ impl Store {
             }
         }
         stats.blobs_removed = stats.entries_evicted;
+        Ok(stats)
+    }
+
+    /// Reclaim entries produced by git worktrees that have since disappeared.
+    ///
+    /// `origin_worktree` is intentionally the producing worktree recorded on a
+    /// local `put()`, not a full reference set. Cache hits stay read-only, so an
+    /// entry reused by another worktree keeps the original producer until it is
+    /// re-put. Reclaiming that entry can cost a future miss, but it cannot drop
+    /// live bytes from other entries: shared artifact blobs are protected by the
+    /// existing `blobs.refcount` machinery, and recent hits are protected by the
+    /// active-restore grace in `remove_entry_guarded`.
+    ///
+    /// Remote imports and legacy entries have no origin and are ignored. Removal
+    /// delegates to `remove_entry_guarded`, preserving the same blob refcount and
+    /// active-restore safety invariants as ordinary GC.
+    pub fn reclaim_orphaned_worktree_entries(&self) -> Result<WorktreeReclaimStats> {
+        if !self.config.reclaim_orphaned_worktrees {
+            return Ok(WorktreeReclaimStats::default());
+        }
+
+        let grace = Duration::from_secs(self.config.worktree_reclaim_grace_secs);
+        let rows: Vec<(String, i64, String)> = {
+            let mut stmt = self.db.prepare(
+                "SELECT cache_key, size, origin_worktree
+                 FROM entries
+                 WHERE committed = 1
+                   AND origin_worktree IS NOT NULL
+                   AND origin_worktree != ''",
+            )?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let roots: Vec<PathBuf> = self
+            .config
+            .worktree_reclaim_roots
+            .iter()
+            .map(|root| canonicalize_existing_dir(root))
+            .collect();
+
+        let mut stats = WorktreeReclaimStats::default();
+        for (key, size, origin) in rows {
+            let origin_path = PathBuf::from(&origin);
+            if !path_is_under_any_root(&origin_path, &roots) || origin_path.exists() {
+                continue;
+            }
+
+            stats.candidates += 1;
+            match self.remove_entry_guarded(&key, Some(grace)) {
+                Ok(true) => {
+                    stats.entries_evicted += 1;
+                    stats.bytes_freed += size as u64;
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!("gc: skipping orphaned-worktree reclaim of {key}: {e:#}");
+                    continue;
+                }
+            }
+        }
+
         Ok(stats)
     }
 
@@ -2148,6 +2245,7 @@ pub struct EntryInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::OptionalExtension;
 
     // Regression guard for #324: the local content-dedup hash must distinguish
     // entries that the old (bare-hash, 16-hex-truncated) fold could collide —
@@ -2299,6 +2397,9 @@ mod tests {
             disabled: false,
             cache_executables: false,
             clean_incremental: true,
+            reclaim_orphaned_worktrees: false,
+            worktree_reclaim_roots: Vec::new(),
+            worktree_reclaim_grace_secs: 24 * 60 * 60,
             event_log_max_size: 1024 * 1024,
             event_log_keep_lines: 100,
             compression_level: 3,
@@ -2314,6 +2415,7 @@ mod tests {
     }
 
     static ENV_VAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CWD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
@@ -2335,6 +2437,24 @@ mod tests {
                 Some(value) => unsafe { std::env::set_var(self.key, value) },
                 None => unsafe { std::env::remove_var(self.key) },
             }
+        }
+    }
+
+    struct CwdGuard {
+        previous: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn enter(path: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
         }
     }
 
@@ -2388,6 +2508,248 @@ mod tests {
         assert_eq!(meta.crate_name, "mylib");
         assert_eq!(meta.files.len(), 1);
         assert_eq!(meta.files[0].name, "libmylib.rlib");
+    }
+
+    #[test]
+    fn reclaim_orphaned_worktree_entries_removes_deleted_origin() {
+        let _lock = CWD_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let workspaces = dir.path().join("workspaces");
+        let worktree = workspaces.join("repo");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        let cwd = CwdGuard::enter(&worktree);
+
+        let mut config = test_config(&dir.path().join("cache"));
+        config.reclaim_orphaned_worktrees = true;
+        config.worktree_reclaim_roots = vec![workspaces.clone()];
+        config.worktree_reclaim_grace_secs = 60;
+
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.path().join("output.rlib");
+        std::fs::write(&output_file, b"fake rlib content").unwrap();
+        store
+            .put(
+                "orphaned_worktree_key",
+                "mylib",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(output_file, "libmylib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.set_last_accessed_for_test("orphaned_worktree_key", "-1 hour");
+
+        drop(cwd);
+        std::fs::remove_dir_all(&worktree).unwrap();
+
+        let stats = store.reclaim_orphaned_worktree_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 1);
+        assert!(!store.contains("orphaned_worktree_key"));
+    }
+
+    #[test]
+    fn reclaim_orphaned_worktree_entries_respects_managed_roots() {
+        let _lock = CWD_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let managed_root = dir.path().join("managed");
+        let outside_root = dir.path().join("outside");
+        let worktree = outside_root.join("repo");
+        std::fs::create_dir_all(&managed_root).unwrap();
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        let cwd = CwdGuard::enter(&worktree);
+
+        let mut config = test_config(&dir.path().join("cache"));
+        config.reclaim_orphaned_worktrees = true;
+        config.worktree_reclaim_roots = vec![managed_root];
+        config.worktree_reclaim_grace_secs = 60;
+
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.path().join("output.rlib");
+        std::fs::write(&output_file, b"fake rlib content").unwrap();
+        store
+            .put(
+                "outside_worktree_key",
+                "mylib",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(output_file, "libmylib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.set_last_accessed_for_test("outside_worktree_key", "-1 hour");
+
+        drop(cwd);
+        std::fs::remove_dir_all(&worktree).unwrap();
+
+        let stats = store.reclaim_orphaned_worktree_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 0);
+        assert!(store.contains("outside_worktree_key"));
+    }
+
+    #[test]
+    fn reclaim_orphaned_worktree_entries_lifecycle_tradeoff() {
+        let _lock = CWD_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let workspaces = dir.path().join("workspaces");
+        let worktree_a = workspaces.join("repo_a");
+        let worktree_b = workspaces.join("repo_b");
+        std::fs::create_dir_all(worktree_a.join(".git")).unwrap();
+        std::fs::create_dir_all(worktree_b.join(".git")).unwrap();
+
+        let mut config = test_config(&dir.path().join("cache"));
+        config.reclaim_orphaned_worktrees = true;
+        config.worktree_reclaim_roots = vec![workspaces.clone()];
+        config.worktree_reclaim_grace_secs = 60;
+
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.path().join("output.rlib");
+        std::fs::write(&output_file, b"fake rlib content").unwrap();
+
+        // 1. Compile in worktree A (miss and put)
+        let cwd_a = CwdGuard::enter(&worktree_a);
+        store
+            .put(
+                "shared_entry_key",
+                "mylib",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(output_file.clone(), "libmylib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        drop(cwd_a);
+
+        assert!(store.contains("shared_entry_key"));
+        let origin: Option<String> = store
+            .db
+            .query_row(
+                "SELECT origin_worktree FROM entries WHERE cache_key = 'shared_entry_key'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        let expected_a = canonicalize_existing_dir(&worktree_a)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(origin, Some(expected_a));
+
+        // 2. Restore in worktree B (hits the cache)
+        let cwd_b = CwdGuard::enter(&worktree_b);
+        let res = store.get("shared_entry_key").unwrap();
+        assert!(res.is_some());
+        drop(cwd_b);
+
+        // Origin stays worktree A (cache hits are read-only)
+        let origin: Option<String> = store
+            .db
+            .query_row(
+                "SELECT origin_worktree FROM entries WHERE cache_key = 'shared_entry_key'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        let expected_a = canonicalize_existing_dir(&worktree_a)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(origin, Some(expected_a));
+
+        // 3. Delete worktree A
+        std::fs::remove_dir_all(&worktree_a).unwrap();
+
+        // 4. Try GC within grace period -> entry is protected and not evicted
+        store.set_last_accessed_for_test("shared_entry_key", "-5 seconds");
+        let stats = store.reclaim_orphaned_worktree_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 0);
+        assert!(store.contains("shared_entry_key"));
+
+        // 5. Try GC past grace period -> entry is reclaimed
+        store.set_last_accessed_for_test("shared_entry_key", "-120 seconds");
+        let stats = store.reclaim_orphaned_worktree_entries().unwrap();
+        assert_eq!(stats.entries_evicted, 1);
+        assert!(!store.contains("shared_entry_key"));
+
+        // 6. Worktree B builds again -> cache miss -> compile succeeds and registers B
+        let cwd_b = CwdGuard::enter(&worktree_b);
+        let res = store.get("shared_entry_key").unwrap();
+        assert!(res.is_none());
+
+        store
+            .put(
+                "shared_entry_key",
+                "mylib",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(output_file, "libmylib.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        drop(cwd_b);
+
+        assert!(store.contains("shared_entry_key"));
+        let origin: Option<String> = store
+            .db
+            .query_row(
+                "SELECT origin_worktree FROM entries WHERE cache_key = 'shared_entry_key'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        let expected_b = canonicalize_existing_dir(&worktree_b)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(origin, Some(expected_b));
+    }
+
+    #[test]
+    fn initialize_db_migrates_existing_entries_with_origin_worktree_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        std::fs::create_dir_all(config.cache_dir.clone()).unwrap();
+
+        {
+            let db = Connection::open(config.index_db_path()).unwrap();
+            db.execute_batch(
+                "CREATE TABLE entries (
+                    cache_key TEXT PRIMARY KEY,
+                    crate_name TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_accessed TEXT NOT NULL DEFAULT (datetime('now')),
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    committed INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&config).unwrap();
+        let origin: Option<String> = store
+            .db
+            .query_row("SELECT origin_worktree FROM entries LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .unwrap()
+            .flatten();
+        assert!(origin.is_none());
     }
 
     #[test]
