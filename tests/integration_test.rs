@@ -747,3 +747,136 @@ fn test_cc_depinfo_restore_preserves_parent_relative_deps() {
     let report = kache_report(cache_dir.path());
     assert_cc_report_counts(&report, 1, 1);
 }
+
+#[test]
+fn test_auto_gc_bounds_store_size() {
+    build_kache();
+
+    let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+
+    // Configure a small max size (e.g. 50 KiB) with auto-GC enabled
+    let config_content = r#"[cache]
+local_only = true
+local_max_size = "50KiB"
+auto_gc = true
+cache_executables = true
+"#;
+    let config_path = isolated_config_path(cache_dir.path());
+    std::fs::write(&config_path, config_content).unwrap();
+
+    // First build (populates the cache past the size budget)
+    let output = std::process::Command::new("cargo")
+        .args(["build"])
+        .current_dir(&test_project)
+        .env("RUSTC_WRAPPER", kache_binary())
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", &config_path)
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .env("CARGO_INCREMENTAL", "0")
+        .env("KACHE_LOG", "kache=debug")
+        .env("KACHE_AUTO_GC_RETRY_DELAY_SECS", "2")
+        .output()
+        .expect("failed to run cargo build");
+    assert!(
+        output.status.success(),
+        "first cargo build failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    println!("STDOUT:\n{}", String::from_utf8_lossy(&output.stdout));
+    println!("STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
+
+    // Connect to SQLite to check initial size and age the entries
+    let db_path = cache_dir.path().join("index.db");
+    assert!(db_path.exists(), "index.db should exist");
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let size_before: i64 = conn
+        .query_row("SELECT COALESCE(SUM(size), 0) FROM entries", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    println!("Store size before GC: {size_before} bytes");
+    assert!(size_before > 50 * 1024, "store should be populated past 50 KiB budget");
+
+    // Age all entries so they are older than EVICTION_IDLE_GRACE (120s)
+    conn.execute(
+        "UPDATE entries SET last_accessed = datetime('now', '-300 seconds'), created_at = datetime('now', '-300 seconds')",
+        [],
+    )
+    .unwrap();
+
+    // Age the stamp file so the next compile triggers the check
+    let stamp_path = cache_dir.path().join("auto-gc-check.stamp");
+    if stamp_path.exists() {
+        let old_time = filetime::FileTime::from_unix_time(
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 600) as i64,
+            0,
+        );
+        filetime::set_file_times(&stamp_path, old_time, old_time).unwrap();
+    }
+
+    // Run clean so the next build compiles and triggers a put() -> GC
+    let _ = std::process::Command::new("cargo")
+        .args(["clean"])
+        .current_dir(&test_project)
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .status();
+
+    // Second build (triggers put() -> maybe_spawn_auto_gc -> background kache gc)
+    let output = std::process::Command::new("cargo")
+        .args(["build"])
+        .current_dir(&test_project)
+        .env("RUSTC_WRAPPER", kache_binary())
+        .env("KACHE_CACHE_DIR", cache_dir.path())
+        .env("KACHE_CONFIG", &config_path)
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .env("CARGO_INCREMENTAL", "0")
+        .env("KACHE_LOG", "kache=debug")
+        .env("KACHE_AUTO_GC_RETRY_DELAY_SECS", "2")
+        .output()
+        .expect("failed to run cargo build");
+    assert!(
+        output.status.success(),
+        "second cargo build failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Age the new entries so that the background worker's second sweep (after 2s sleep)
+    // will see them as expired and evict them.
+    conn.execute(
+        "UPDATE entries SET last_accessed = datetime('now', '-300 seconds'), created_at = datetime('now', '-300 seconds')",
+        [],
+    )
+    .unwrap();
+
+    // Poll the SQLite size until it drops below the budget (50 KiB)
+    let mut size_after = size_before;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        size_after = conn
+            .query_row("SELECT COALESCE(SUM(size), 0) FROM entries", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        if size_after <= 50 * 1024 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    println!("Store size after GC: {size_after} bytes");
+    assert!(
+        size_after <= 50 * 1024,
+        "auto-GC failed to evict store below budget, current size: {size_after}"
+    );
+}

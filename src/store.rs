@@ -1807,7 +1807,7 @@ impl Store {
             }
         };
 
-        {
+        let rows_affected = {
             let tx = self.db.unchecked_transaction()?;
 
             // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
@@ -1827,31 +1827,37 @@ impl Store {
                 }
             }
 
-            for hash in &hashes {
-                tx.execute(
-                    "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
-                    params![hash],
-                )?;
-                let refcount: Option<i64> = tx
-                    .query_row(
-                        "SELECT refcount FROM blobs WHERE hash = ?1",
-                        params![hash],
-                        |row| row.get(0),
-                    )
-                    .ok();
-                if matches!(refcount, Some(rc) if rc <= 0) {
-                    tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
-                    // Unlink under the write lock so a concurrent adopter can't
-                    // commit a reference to a file we're deleting.
-                    unlink_blob(&self.blob_path(hash));
-                }
-            }
-            tx.execute(
+            // Delete the entry row first. If rows_affected is 0, it means another thread
+            // already removed this entry; we skip decrementing blob refcounts to avoid leak/underflow.
+            let rows_affected = tx.execute(
                 "DELETE FROM entries WHERE cache_key = ?1",
                 params![cache_key],
             )?;
+
+            if rows_affected > 0 {
+                for hash in &hashes {
+                    tx.execute(
+                        "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
+                        params![hash],
+                    )?;
+                    let refcount: Option<i64> = tx
+                        .query_row(
+                            "SELECT refcount FROM blobs WHERE hash = ?1",
+                            params![hash],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if matches!(refcount, Some(rc) if rc <= 0) {
+                        tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
+                        // Unlink under the write lock so a concurrent adopter can't
+                        // commit a reference to a file we're deleting.
+                        unlink_blob(&self.blob_path(hash));
+                    }
+                }
+            }
             tx.commit()?;
-        }
+            rows_affected
+        };
 
         // Remove the entry directory (just meta.json in new format, may have
         // artifacts in legacy entries).
@@ -1869,7 +1875,7 @@ impl Store {
             fs::remove_dir_all(&entry_dir)?;
         }
 
-        Ok(true)
+        Ok(rows_affected > 0 || !hashes.is_empty())
     }
 
     /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
@@ -2291,6 +2297,7 @@ mod tests {
             local_only: false,
             modified_input_guard: false,
             windows_hardlink: false,
+            auto_gc: true,
             path_only_env_vars: Vec::new(),
             cache_dir: dir.to_path_buf(),
             max_size: 1024 * 1024, // 1 MiB

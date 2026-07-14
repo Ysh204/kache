@@ -83,6 +83,7 @@ mod tests {
             local_only: false,
             modified_input_guard: false,
             windows_hardlink: false,
+            auto_gc: true,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache-test"),
             max_size: 1024,

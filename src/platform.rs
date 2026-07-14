@@ -140,6 +140,28 @@ pub async fn wait_for_shutdown() {
     }
 }
 
+/// Configure a process to be fully detached (in its own process group on Unix,
+/// or with detached creation flags on Windows) so that pressing Ctrl-C on the parent
+/// does not terminate the child.
+pub fn configure_detached_process(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP = 0x00000200
+        // DETACHED_PROCESS = 0x00000008
+        cmd.creation_flags(0x00000200 | 0x00000008);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = cmd;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
