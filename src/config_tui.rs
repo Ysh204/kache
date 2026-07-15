@@ -102,6 +102,9 @@ struct EditorState {
     /// `[cache] windows_hardlink` as loaded — the editor has no form field for
     /// it, so carry it through verbatim on save (#429).
     preserved_windows_hardlink: Option<bool>,
+    /// `[cache] auto_gc` as loaded — the editor has no form field for it, so
+    /// carry it through verbatim on save (kunobi-ninja/kache#497).
+    preserved_auto_gc: Option<bool>,
     /// `[cache] ignore_env` as loaded — the editor has no form field for it, so
     /// carry it through verbatim on save (dropping it would silently disable the
     /// env lockdown).
@@ -411,6 +414,7 @@ fn fields_to_file_config(
     preserved_remote_readonly: Option<bool>,
     preserved_modified_input_guard: Option<bool>,
     preserved_windows_hardlink: Option<bool>,
+    preserved_auto_gc: Option<bool>,
     preserved_ignore_env: Option<bool>,
 ) -> FileConfig {
     let get = |key: &str| -> Option<String> {
@@ -491,6 +495,7 @@ fn fields_to_file_config(
             remote_readonly: preserved_remote_readonly,
             modified_input_guard: preserved_modified_input_guard,
             windows_hardlink: preserved_windows_hardlink,
+            auto_gc: preserved_auto_gc,
             ignore_env: preserved_ignore_env,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
@@ -547,6 +552,7 @@ pub fn run_config_editor() -> Result<()> {
             .as_ref()
             .and_then(|c| c.modified_input_guard),
         preserved_windows_hardlink: file_config.cache.as_ref().and_then(|c| c.windows_hardlink),
+        preserved_auto_gc: file_config.cache.as_ref().and_then(|c| c.auto_gc),
         preserved_ignore_env: file_config.cache.as_ref().and_then(|c| c.ignore_env),
     };
 
@@ -736,6 +742,7 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_remote_readonly,
         state.preserved_modified_input_guard,
         state.preserved_windows_hardlink,
+        state.preserved_auto_gc,
         state.preserved_ignore_env,
     );
     match Config::save_file_config_to(&config, path) {
@@ -1181,6 +1188,7 @@ mod tests {
                 remote_readonly: None,
                 modified_input_guard: None,
                 windows_hardlink: None,
+                auto_gc: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
@@ -1229,6 +1237,7 @@ mod tests {
             original.cache.as_ref().and_then(|c| c.remote_readonly),
             original.cache.as_ref().and_then(|c| c.modified_input_guard),
             original.cache.as_ref().and_then(|c| c.windows_hardlink),
+            original.cache.as_ref().and_then(|c| c.auto_gc),
             original.cache.as_ref().and_then(|c| c.ignore_env),
         );
 
@@ -1263,7 +1272,9 @@ mod tests {
     fn test_fields_to_file_config_empty_omits_remote() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        let result = fields_to_file_config(&fields, None, None, None, None, None, None, None, None);
+        let result = fields_to_file_config(
+            &fields, None, None, None, None, None, None, None, None, None,
+        );
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
 
@@ -1332,6 +1343,7 @@ mod tests {
             preserved_remote_readonly: None,
             preserved_modified_input_guard: None,
             preserved_windows_hardlink: None,
+            preserved_auto_gc: None,
             preserved_ignore_env: None,
         }
     }

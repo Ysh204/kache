@@ -1199,8 +1199,90 @@ pub fn list(config: &Config, crate_name: Option<&str>, sort_by: &str) -> Result<
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcMode {
+    Cli,
+    Background,
+}
+
+impl GcMode {
+    pub fn from_env() -> Self {
+        if std::env::var_os("KACHE_AUTO_GC_WORKER").is_some() {
+            GcMode::Background
+        } else {
+            GcMode::Cli
+        }
+    }
+}
+
+/// Run garbage collection locally under `gc.lock`.
+pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
+    let verbose = mode == GcMode::Cli;
+    let store = Store::open(config)?;
+    let _gc_lock = match store.try_gc_lock()? {
+        Some(lock) => lock,
+        None => {
+            if verbose {
+                println!("Another GC is already running; skipping.");
+            }
+            return Ok(());
+        }
+    };
+
+    if verbose {
+        print!("Backfilling content hashes...");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }
+    let backfilled = store.backfill_content_hashes().unwrap_or(0);
+    if verbose {
+        if backfilled > 0 {
+            println!(" {backfilled} entries updated.");
+        } else {
+            println!(" up to date.");
+        }
+    }
+
+    if verbose {
+        print!("Deduplicating entries...");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }
+    let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
+    if verbose {
+        if dedup_stats.entries_evicted > 0 {
+            println!(" removed {} duplicates.", dedup_stats.entries_evicted);
+        } else {
+            println!(" no duplicates found.");
+        }
+    }
+
+    if verbose {
+        print!("Running eviction...");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }
+    let evict_stats = store.evict()?;
+    if verbose {
+        println!(" evicted {} entries.", evict_stats.entries_evicted);
+    }
+
+    Ok(())
+}
+
 /// Run garbage collection via the daemon.
 pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
+    let mode = GcMode::from_env();
+    if mode == GcMode::Background {
+        let sleep_secs = std::env::var("KACHE_AUTO_GC_RETRY_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(121);
+
+        // Run background sweep-sleep-sweep loop
+        run_gc_local(config, GcMode::Background).ok();
+        std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
+        run_gc_local(config, GcMode::Background).ok();
+        return Ok(());
+    }
+
     match crate::daemon::send_gc_request(config, max_age_hours) {
         Ok(outcome) if outcome.skipped => {
             println!("Another GC is already running; skipping.");
@@ -1220,47 +1302,22 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
         }
         Err(e) => {
             println!("Daemon GC failed ({e}), running locally...");
-            let store = Store::open(config)?;
-
-            // Cross-process GC mutual exclusion (kunobi-ninja/kache#326): bail if
-            // another GC (e.g. a live daemon's sweep) already holds gc.lock.
-            let _gc_lock = match store.try_gc_lock()? {
-                Some(lock) => lock,
-                None => {
-                    println!("Another GC is already running; skipping.");
-                    return Ok(());
-                }
-            };
-
-            // Backfill content hashes for legacy entries
-            print!("Backfilling content hashes...");
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-            let backfilled = store.backfill_content_hashes().unwrap_or(0);
-            if backfilled > 0 {
-                println!(" {backfilled} entries updated.");
+            if let Some(hours) = max_age_hours {
+                let store = Store::open(config)?;
+                let _gc_lock = match store.try_gc_lock()? {
+                    Some(lock) => lock,
+                    None => {
+                        println!("Another GC is already running; skipping.");
+                        return Ok(());
+                    }
+                };
+                print!("Running eviction...");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                let evict_stats = store.evict_older_than(hours)?;
+                println!(" evicted {} entries.", evict_stats.entries_evicted);
             } else {
-                println!(" up to date.");
+                run_gc_local(config, GcMode::Cli)?;
             }
-
-            // Evict duplicate entries
-            print!("Deduplicating entries...");
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-            let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
-            if dedup_stats.entries_evicted > 0 {
-                println!(" removed {} duplicates.", dedup_stats.entries_evicted);
-            } else {
-                println!(" no duplicates found.");
-            }
-
-            // Size/age-based eviction
-            print!("Running eviction...");
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-            let evict_stats = if let Some(hours) = max_age_hours {
-                store.evict_older_than(hours)?
-            } else {
-                store.evict()?
-            };
-            println!(" evicted {} entries.", evict_stats.entries_evicted);
         }
     }
 
@@ -4322,6 +4379,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
+            auto_gc: true,
             path_only_env_vars: Vec::new(),
             cache_dir,
             max_size: 1024 * 1024,

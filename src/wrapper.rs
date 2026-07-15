@@ -188,6 +188,136 @@ fn warn_store_unavailable_once(config: &Config, err: &anyhow::Error) {
     warn_once_per_session(&marker, WARN_SESSION_SECS, &store_unavailable_message(err));
 }
 
+// ── Opportunistic size-pressure GC (kunobi-ninja/kache#497) ─────────────────
+//
+// Store-wide eviction used to be triggered only from daemon-owned paths (the
+// periodic GC task and the post-upload check), so a local-only build with no
+// running daemon grew the store past `max_size` without bound. The wrapper
+// now performs a cheap, throttled size check after storing a new entry and,
+// when the store has outgrown `max_size` (plus slack), spawns a *detached*
+// `kache gc` — the eviction itself never runs inside the compile hot path,
+// and `gc.lock` (kunobi-ninja/kache#326) serializes concurrent GC drivers so
+// racing wrappers cannot double-scan.
+
+/// How often the wrapper is willing to re-run the store-size query. Between
+/// checks the hot-path cost is a single `stat()` on the stamp file.
+const AUTO_GC_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Slack over `max_size` before a background GC is spawned, in percent.
+/// `evict()` already targets 90% of `max_size`; triggering only above 110%
+/// keeps the two thresholds apart so the store doesn't thrash at the boundary.
+const AUTO_GC_SLACK_PERCENT: u64 = 10;
+
+/// Throttle stamp for the auto-GC size check. Lives next to the store so all
+/// wrappers sharing a cache dir share the throttle.
+fn auto_gc_stamp_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("auto-gc-check.stamp")
+}
+
+/// Decide whether a background GC should be spawned: auto-GC enabled, the
+/// throttle interval elapsed, and the store over `max_size` plus slack.
+/// Touches the stamp *before* the size query so concurrent wrappers don't
+/// stampede on the SQLite `SUM`. Split from [`maybe_spawn_auto_gc`] so the
+/// decision is unit-testable without spawning processes.
+fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
+    if !config.auto_gc {
+        return false;
+    }
+    let stamp = auto_gc_stamp_path(&config.cache_dir);
+    if let Ok(meta) = std::fs::metadata(&stamp) {
+        match meta.modified().ok().and_then(|m| m.elapsed().ok()) {
+            Some(age) if age < AUTO_GC_CHECK_INTERVAL => return false,
+            // `elapsed()` errs when the mtime is in the future (clock skew /
+            // another process just touched it) — treat as fresh and skip.
+            None => return false,
+            _ => {}
+        }
+    }
+
+    let total = match store.total_size() {
+        Ok(total) => total,
+        Err(e) => {
+            tracing::debug!("auto-gc: store size query failed: {e:#}");
+            return false;
+        }
+    };
+    let threshold = config
+        .max_size
+        .saturating_add(config.max_size / 100 * AUTO_GC_SLACK_PERCENT);
+    if total <= threshold {
+        let now_str = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+        let _ = std::fs::write(&stamp, now_str);
+        return false;
+    }
+
+    // Exceeded threshold — claim this check slot before spawning GC
+    let now_str = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+    if std::fs::write(&stamp, now_str).is_err() {
+        return false;
+    }
+
+    tracing::info!(
+        "auto-gc: store size {} exceeds max {} (+{}% slack), triggering background GC",
+        total,
+        config.max_size,
+        AUTO_GC_SLACK_PERCENT
+    );
+    true
+}
+
+/// Spawn a fully detached `kache gc` if [`auto_gc_wanted`] says so. Never
+/// waits on the child; stdio is null so it cannot pollute the compiler's
+/// output streams.
+fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
+    if !auto_gc_wanted(config, store) {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            tracing::warn!("auto-gc: cannot resolve current executable: {e}");
+            return;
+        }
+    };
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(config.cache_dir.join("auto-gc.log"));
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("gc")
+        .env("KACHE_AUTO_GC_WORKER", "1")
+        .stdin(std::process::Stdio::null());
+
+    match log_file {
+        Ok(f) => {
+            if let Ok(dup) = f.try_clone() {
+                cmd.stdout(dup);
+            } else {
+                cmd.stdout(std::process::Stdio::null());
+            }
+            cmd.stderr(f);
+        }
+        Err(_) => {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+
+    crate::platform::configure_detached_process(&mut cmd);
+
+    match cmd.spawn() {
+        Ok(_) => tracing::info!("auto-gc: spawned background `kache gc`"),
+        Err(e) => tracing::warn!("auto-gc: failed to spawn `kache gc`: {e}"),
+    }
+}
+
 fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     if put.is_full_dup() {
         EventResult::Dup
@@ -454,6 +584,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             if !meta.stderr.is_empty() {
                 eprint!("{}", meta.stderr);
             }
+
             return Ok(0);
         }
     }
@@ -512,7 +643,12 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             &result.stderr,
             compile_time_ms,
         ) {
-            Ok(result) => store_put = result,
+            Ok(result) => {
+                store_put = result;
+                // Store grew — throttled size check + detached background GC if over
+                // budget (kunobi-ninja/kache#497). Never blocks the compile path.
+                maybe_spawn_auto_gc(config, &store);
+            }
             Err(e) => tracing::warn!("failed to store cc cache entry for {}: {}", crate_name, e),
         }
 
@@ -1019,6 +1155,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 eprint!("{}", meta.stderr);
             }
             clean_incremental_dir(config, &args);
+
             return Ok(0);
         }
     }
@@ -1349,7 +1486,12 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         &result.stderr,
         compile_time_ms,
     ) {
-        Ok(result) => store_put = result,
+        Ok(result) => {
+            store_put = result;
+            // Store grew — throttled size check + detached background GC if over
+            // budget (kunobi-ninja/kache#497). Never blocks the compile path.
+            maybe_spawn_auto_gc(config, &store);
+        }
         Err(e) => tracing::warn!("failed to store cache entry: {}", e),
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
@@ -2296,6 +2438,91 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
+    // ── Opportunistic size-pressure GC (kunobi-ninja/kache#497) ─────────────
+
+    /// Store a small entry so the store has a nonzero size.
+    fn put_test_entry(store: &Store, dir: &std::path::Path, key: &str) {
+        let src = dir.join(format!("{key}.o"));
+        std::fs::write(&src, vec![0xABu8; 4096]).unwrap();
+        store
+            .put(
+                key,
+                "test-crate",
+                &[],
+                &[],
+                "host",
+                "dev",
+                &[(src, format!("{key}.o"))],
+                "",
+                "",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn auto_gc_wanted_fires_only_over_budget_and_respects_throttle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        let store = Store::open(&cfg).unwrap();
+        put_test_entry(&store, dir.path(), "auto-gc-key-1");
+
+        // Under budget (max_size = 1 MiB, entry = 4 KiB): no GC wanted,
+        // but the stamp is written to throttle future check intervals.
+        assert!(
+            !auto_gc_wanted(&cfg, &store),
+            "under budget must not trigger"
+        );
+        let stamp = auto_gc_stamp_path(&cfg.cache_dir);
+        assert!(stamp.exists(), "under budget must create the stamp");
+
+        // Over budget but with a fresh stamp: check is throttled.
+        cfg.max_size = 1024; // 1 KiB budget, store holds 4 KiB (> +10% slack)
+        assert!(
+            !auto_gc_wanted(&cfg, &store),
+            "fresh stamp must throttle the check even if over budget"
+        );
+
+        // Age the stamp past the interval → over-budget check now fires.
+        let old = std::time::SystemTime::now() - (AUTO_GC_CHECK_INTERVAL * 2);
+        let stamp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stamp)
+            .unwrap();
+        stamp_file.set_modified(old).unwrap();
+        drop(stamp_file);
+        assert!(
+            auto_gc_wanted(&cfg, &store),
+            "over budget with an expired stamp must trigger"
+        );
+        // ... and the successful check re-stamps, throttling the next one.
+        assert!(
+            !auto_gc_wanted(&cfg, &store),
+            "the triggering check must re-claim the stamp"
+        );
+    }
+
+    #[test]
+    fn auto_gc_wanted_respects_disable_and_slack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        let store = Store::open(&cfg).unwrap();
+        put_test_entry(&store, dir.path(), "auto-gc-key-2");
+
+        // Disabled: never triggers, regardless of size.
+        cfg.auto_gc = false;
+        cfg.max_size = 1;
+        assert!(!auto_gc_wanted(&cfg, &store), "auto_gc=false must disable");
+
+        // Enabled but within the +10% slack band: no trigger. The store holds
+        // exactly 4096 bytes; max_size 4000 → threshold 4400 ≥ 4096.
+        cfg.auto_gc = true;
+        cfg.max_size = 4000;
+        assert!(
+            !auto_gc_wanted(&cfg, &store),
+            "inside the slack band must not trigger"
+        );
+    }
+
     fn test_config(cache_dir: PathBuf) -> Config {
         Config {
             fallback: None,
@@ -2305,6 +2532,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
+            auto_gc: true,
             path_only_env_vars: Vec::new(),
             cache_dir,
             max_size: 1024 * 1024,

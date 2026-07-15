@@ -107,6 +107,19 @@ pub struct Config {
     /// working-tree dedup on NTFS. No effect off Windows. Set via
     /// `KACHE_WINDOWS_HARDLINK=1`/`=true` or `[cache] windows_hardlink`.
     pub windows_hardlink: bool,
+    /// Opportunistic size-pressure GC (kunobi-ninja/kache#497): when on (the
+    /// default), the compiler wrapper — after storing a new entry — performs a
+    /// cheap, throttled store-size check and, if the store has grown past
+    /// `max_size` (plus slack), spawns a detached `kache gc` in the
+    /// background. This keeps `max_size` enforced for local-only builds where
+    /// no daemon is running (the daemon's periodic GC and post-upload sweep
+    /// were previously the *only* eviction triggers, so a daemon-less store
+    /// grew without bound). GC never runs inside the compile hot path — the
+    /// wrapper only pays one `stat()` per compile (plus one SQLite `SUM` at
+    /// most once per check interval) and the actual eviction happens in the
+    /// spawned process, serialized by `gc.lock`. Set via `KACHE_AUTO_GC=0`/
+    /// `=false` or `[cache] auto_gc = false` to disable.
+    pub auto_gc: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +167,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) modified_input_guard: Option<bool>,
     /// Windows hardlink restore opt-in. See [`Config::windows_hardlink`].
     pub(crate) windows_hardlink: Option<bool>,
+    /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
+    pub(crate) auto_gc: Option<bool>,
     /// Ignore `KACHE_*` env overrides for file-backed settings. File-only by
     /// design (env must not re-enable env). See [`Config::ignore_env_enabled`].
     pub(crate) ignore_env: Option<bool>,
@@ -293,6 +308,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_LOCAL_ONLY",
     "KACHE_REMOTE_READONLY",
     "KACHE_MODIFIED_INPUT_GUARD",
+    "KACHE_AUTO_GC",
     "KACHE_PLANNER_ENDPOINT",
     "KACHE_PLANNER_TIMEOUT_MS",
     "KACHE_PLANNER_TOKEN",
@@ -526,6 +542,7 @@ impl Config {
         let remote_readonly = Self::remote_readonly_enabled(&file_config);
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
+        let auto_gc = Self::auto_gc_enabled(&file_config);
         let remote = if local_only {
             None
         } else {
@@ -541,6 +558,7 @@ impl Config {
             remote_readonly,
             modified_input_guard,
             windows_hardlink,
+            auto_gc,
             cache_executables,
             clean_incremental,
             event_log_max_size,
@@ -744,6 +762,23 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.windows_hardlink)
             .unwrap_or(false)
+    }
+
+    /// Opportunistic size-pressure GC (kunobi-ninja/kache#497): on by default so
+    /// `max_size` is enforced even for daemon-less, local-only builds.
+    /// `KACHE_AUTO_GC=0`/`=false` (env wins), else `[cache] auto_gc`, else on.
+    /// See [`Config::auto_gc`].
+    fn auto_gc_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_AUTO_GC", ignore_env) {
+            return v != "0" && !v.eq_ignore_ascii_case("false");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.auto_gc)
+            .unwrap_or(true)
     }
 
     pub fn load_planner_config() -> Option<PlannerConfig> {
@@ -1255,6 +1290,7 @@ mod tests {
                 remote_readonly: None,
                 modified_input_guard: None,
                 windows_hardlink: None,
+                auto_gc: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,
@@ -1433,6 +1469,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
+            auto_gc: true,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1460,6 +1497,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
+            auto_gc: true,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1487,6 +1525,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
+            auto_gc: true,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1517,6 +1556,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
+            auto_gc: true,
             path_only_env_vars: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
             max_size: 1024,
@@ -1706,6 +1746,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 remote_readonly: None,
                 modified_input_guard: None,
                 windows_hardlink: None,
+                auto_gc: None,
                 ignore_env: None,
                 fallback: None,
                 key_salt: None,

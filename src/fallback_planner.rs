@@ -122,6 +122,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             windows_hardlink: false,
+            auto_gc: true,
             path_only_env_vars: Vec::new(),
             cache_dir,
             max_size: 1024 * 1024,
