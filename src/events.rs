@@ -224,6 +224,26 @@ pub fn read_events_since(event_log_path: &Path, since: DateTime<Utc>) -> Result<
     Ok(all.into_iter().filter(|e| e.ts >= since).collect())
 }
 
+#[cfg(windows)]
+fn get_file_identity(file: &std::fs::File) -> Option<(u32, u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let handle = file.as_raw_handle();
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(handle as _, &mut info) };
+    if ok != 0 {
+        Some((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Tail the event log, returning new events since the last known position.
 pub struct EventTailer {
     path: PathBuf,
@@ -262,6 +282,45 @@ impl EventTailer {
             match File::open(&self.path) {
                 Ok(file) => self.file = Some(file),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        let mut rotated = false;
+        if let Some(file) = &self.file {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(m1) = file.metadata()
+                    && let Ok(m2) = std::fs::metadata(&self.path)
+                    && (m1.dev() != m2.dev() || m1.ino() != m2.ino())
+                {
+                    rotated = true;
+                }
+            }
+            #[cfg(windows)]
+            {
+                if let Some(id1) = get_file_identity(file)
+                    && let Ok(f2) = std::fs::File::open(&self.path)
+                    && let Some(id2) = get_file_identity(&f2)
+                    && id1 != id2
+                {
+                    rotated = true;
+                }
+            }
+        }
+
+        if rotated {
+            match File::open(&self.path) {
+                Ok(file) => {
+                    self.file = Some(file);
+                    self.position = 0;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.file = None;
+                    self.position = 0;
+                    return Ok(Vec::new());
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -311,6 +370,13 @@ fn rotate_log_impl(
         return Ok(());
     }
 
+    // Lock-free stat gate to keep the hot path cheap when rotation is not needed.
+    if let Ok(meta) = fs::metadata(log_path)
+        && meta.len() <= max_size
+    {
+        return Ok(());
+    }
+
     // 1. Acquire the lock before querying metadata or reading
     let lock = open_log_lock(log_path).context("opening log lock")?;
     lock.lock().context("locking log for rotation")?;
@@ -322,25 +388,21 @@ fn rotate_log_impl(
         }
 
         // Clean up stale temp files in the same directory (older than 5 minutes)
-        if let Some(parent) = log_path.parent() {
-            if let Ok(entries) = fs::read_dir(parent) {
-                let file_prefix = log_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let temp_marker = format!("{}.tmp.", file_prefix);
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with(&temp_marker) {
-                            if let Ok(meta) = fs::metadata(&path) {
-                                if let Ok(modified) = meta.modified() {
-                                    if let Ok(age) = modified.elapsed() {
-                                        if age > std::time::Duration::from_secs(300) {
-                                            let _ = fs::remove_file(&path);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+        if let Some(parent) = log_path.parent()
+            && let Ok(entries) = fs::read_dir(parent)
+        {
+            let file_prefix = log_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let temp_marker = format!("{}.tmp.", file_prefix);
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && name.starts_with(&temp_marker)
+                    && let Ok(meta) = fs::metadata(&path)
+                    && let Ok(modified) = meta.modified()
+                    && let Ok(age) = modified.elapsed()
+                    && age > std::time::Duration::from_secs(300)
+                {
+                    let _ = fs::remove_file(&path);
                 }
             }
         }
@@ -359,7 +421,10 @@ fn rotate_log_impl(
 
         // Generate unique temp file path using PID
         let pid = std::process::id();
-        let mut temp_name = log_path.file_name().ok_or_else(|| anyhow::anyhow!("invalid log path"))?.to_owned();
+        let mut temp_name = log_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("invalid log path"))?
+            .to_owned();
         temp_name.push(format!(".tmp.{pid}"));
         let temp_path = log_path.with_file_name(temp_name);
 
@@ -371,7 +436,8 @@ fn rotate_log_impl(
             .open(&temp_path)
             .context("opening temp log file")?;
         let output = kept.join("\n") + "\n";
-        file.write_all(output.as_bytes()).context("writing kept lines to temp file")?;
+        file.write_all(output.as_bytes())
+            .context("writing kept lines to temp file")?;
         file.sync_all().context("flushing log temp file")?;
         drop(file); // Close temp file
 
@@ -395,7 +461,9 @@ fn rotate_log_impl(
                         let _ = fs::remove_file(&temp_path);
                         return Err(e).context("renaming log file");
                     }
-                    std::thread::sleep(std::time::Duration::from_millis((1u64 << attempt.min(6)).min(64)));
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        (1u64 << attempt.min(6)).min(64),
+                    ));
                 }
             }
         }
@@ -408,10 +476,10 @@ fn rotate_log_impl(
         // On Unix, fsync the parent directory to guarantee rename durability
         #[cfg(unix)]
         {
-            if let Some(parent) = log_path.parent() {
-                if let Ok(dir) = File::open(parent) {
-                    let _ = dir.sync_all();
-                }
+            if let Some(parent) = log_path.parent()
+                && let Ok(dir) = File::open(parent)
+            {
+                let _ = dir.sync_all();
             }
         }
 
@@ -1013,6 +1081,32 @@ mod tests {
     }
 
     #[test]
+    fn test_event_tailer_handles_rename_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+
+        let event = test_event("test", EventResult::Miss, 100, 80, 1024, "key");
+
+        // Write several events
+        for _ in 0..5 {
+            log_event(&log_path, &event).unwrap();
+        }
+
+        // Start tailing from start
+        let mut tailer = EventTailer::from_start(log_path.clone());
+        assert_eq!(tailer.poll().unwrap().len(), 5);
+
+        rotate_if_needed(&log_path, 1500, 2).unwrap();
+
+        // Write one more event to the newly rotated log
+        log_event(&log_path, &event).unwrap();
+
+        // Tailer should detect the inode/file index change and reopen/reset position
+        let events = tailer.poll().unwrap();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
     fn test_concurrent_log_append_and_rotate() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1025,39 +1119,78 @@ mod tests {
         log_event(&log_path, &first_event).unwrap();
 
         let running = Arc::new(AtomicBool::new(true));
-        
+        let appender_done = Arc::new(AtomicBool::new(false));
+
         // Spawn a background rotator thread
         let log_path_clone = log_path.clone();
         let running_clone = running.clone();
         let rotator = std::thread::spawn(move || {
-            // Use a tiny max_size to force rotation to trigger constantly
+            // Keep 20 lines, max_size 4000 to trigger rotation
             while running_clone.load(Ordering::Relaxed) {
-                let _ = rotate_if_needed(&log_path_clone, 300, 5);
-                std::thread::yield_now();
+                let _ = rotate_if_needed(&log_path_clone, 4000, 20);
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
 
         // Spawn appender thread
         let log_path_clone2 = log_path.clone();
+        let appender_done_clone = appender_done.clone();
         let appender = std::thread::spawn(move || {
             for i in 1..=200 {
                 let event = test_event(&i.to_string(), EventResult::LocalHit, 10, 10, 100, "key");
-                let _ = log_event(&log_path_clone2, &event);
-                // sleep slightly to allow rotator to interleave
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                log_event(&log_path_clone2, &event).expect("log_event failed");
+                std::thread::sleep(std::time::Duration::from_millis(3));
             }
+            appender_done_clone.store(true, Ordering::Relaxed);
+        });
+
+        // Spawn tailer/monitor thread
+        let log_path_clone3 = log_path.clone();
+        let running_clone3 = running.clone();
+        let appender_done_clone2 = appender_done.clone();
+        let tailer_thread = std::thread::spawn(move || {
+            let mut tailer = EventTailer::from_start(log_path_clone3);
+            let mut polled_ids = std::collections::HashSet::new();
+            polled_ids.insert(0);
+
+            while running_clone3.load(Ordering::Relaxed)
+                || !appender_done_clone2.load(Ordering::Relaxed)
+            {
+                if let Ok(events) = tailer.poll() {
+                    for event in events {
+                        if let Ok(id) = event.crate_name.parse::<usize>() {
+                            polled_ids.insert(id);
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+
+            // Final drain
+            if let Ok(events) = tailer.poll() {
+                for event in events {
+                    if let Ok(id) = event.crate_name.parse::<usize>() {
+                        polled_ids.insert(id);
+                    }
+                }
+            }
+            polled_ids
         });
 
         appender.join().unwrap();
         running.store(false, Ordering::Relaxed);
         rotator.join().unwrap();
+        let polled_ids = tailer_thread.join().unwrap();
 
         // Verify the final log file contents
         let content = fs::read_to_string(&log_path).unwrap();
-        
+
         // 1. Assert trailing newline is preserved exactly
         assert!(content.ends_with("\n"), "log must end with a newline");
-        assert!(!content.ends_with("\n\n"), "log must not end with double newlines");
+        assert!(
+            !content.ends_with("\n\n"),
+            "log must not end with double newlines"
+        );
 
         // 2. Parse surviving events
         let mut ids = Vec::new();
@@ -1065,18 +1198,34 @@ mod tests {
             if line.trim().is_empty() {
                 continue;
             }
-            let event: BuildEvent = serde_json::from_str(line).expect("each line must be valid JSON");
-            let id: usize = event.crate_name.parse().expect("crate name must be parsed as id");
+            let event: BuildEvent =
+                serde_json::from_str(line).expect("each line must be valid JSON");
+            let id: usize = event
+                .crate_name
+                .parse()
+                .expect("crate name must be parsed as id");
             ids.push(id);
         }
 
-        // 3. Verify no gaps in the surviving sequence
+        // 3. Verify no gaps in the surviving sequence in the log file
         assert!(!ids.is_empty(), "at least some events must survive");
+        assert!(ids.len() > 1, "multiple events must survive");
         let start = ids[0];
         let end = ids[ids.len() - 1];
-        
-        // Check that the sequence is strictly sequential and without gaps
         let expected: Vec<usize> = (start..=end).collect();
-        assert_eq!(ids, expected, "there must be no missing events or gaps in the surviving log: got {:?}", ids);
+        assert_eq!(
+            ids, expected,
+            "there must be no missing events or gaps in the surviving log: got {:?}",
+            ids
+        );
+
+        // 4. Verify that the EventTailer observed EVERY single event (0..=200) without loss
+        for expected_id in 0..=200 {
+            assert!(
+                polled_ids.contains(&expected_id),
+                "EventTailer missed event ID {}",
+                expected_id
+            );
+        }
     }
 }
