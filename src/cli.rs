@@ -1272,7 +1272,7 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
         let sleep_secs = std::env::var("KACHE_AUTO_GC_RETRY_DELAY_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(120);
+            .unwrap_or(121);
 
         // Run background sweep-sleep-sweep loop
         run_gc_local(config, GcMode::Background).ok();

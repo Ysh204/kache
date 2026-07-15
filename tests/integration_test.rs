@@ -878,6 +878,16 @@ cache_executables = true
     }
 
     println!("Store size after GC: {size_after} bytes");
+    if size_after > 50 * 1024 {
+        let log_path = cache_dir.path().join("auto-gc.log");
+        if log_path.exists() {
+            if let Ok(log_content) = std::fs::read_to_string(&log_path) {
+                println!("--- AUTO-GC.LOG CONTENT ---");
+                println!("{}", log_content);
+                println!("----------------------------");
+            }
+        }
+    }
     assert!(
         size_after <= 50 * 1024,
         "auto-GC failed to evict store below budget, current size: {size_after}"

@@ -245,6 +245,11 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
         .max_size
         .saturating_add(config.max_size / 100 * AUTO_GC_SLACK_PERCENT);
     if total <= threshold {
+        let now_str = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+        let _ = std::fs::write(&stamp, now_str);
         return false;
     }
 
@@ -280,12 +285,30 @@ fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
             return;
         }
     };
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(config.cache_dir.join("auto-gc.log"));
+
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("gc")
         .env("KACHE_AUTO_GC_WORKER", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null());
+
+    match log_file {
+        Ok(f) => {
+            if let Ok(dup) = f.try_clone() {
+                cmd.stdout(dup);
+            } else {
+                cmd.stdout(std::process::Stdio::null());
+            }
+            cmd.stderr(f);
+        }
+        Err(_) => {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
 
     crate::platform::configure_detached_process(&mut cmd);
 
@@ -2444,26 +2467,19 @@ mod tests {
         put_test_entry(&store, dir.path(), "auto-gc-key-1");
 
         // Under budget (max_size = 1 MiB, entry = 4 KiB): no GC wanted,
-        // and because we check size first, no stamp is written yet.
+        // but the stamp is written to throttle future check intervals.
         assert!(
             !auto_gc_wanted(&cfg, &store),
             "under budget must not trigger"
         );
         let stamp = auto_gc_stamp_path(&cfg.cache_dir);
-        assert!(!stamp.exists(), "under budget must not create the stamp");
+        assert!(stamp.exists(), "under budget must create the stamp");
 
-        // Over budget with no stamp: triggers immediately and writes the stamp.
+        // Over budget but with a fresh stamp: check is throttled.
         cfg.max_size = 1024; // 1 KiB budget, store holds 4 KiB (> +10% slack)
         assert!(
-            auto_gc_wanted(&cfg, &store),
-            "over budget with no stamp must trigger"
-        );
-        assert!(stamp.exists(), "triggering must write the stamp");
-
-        // Subsequent check: stamp is now fresh -> throttled, no trigger.
-        assert!(
             !auto_gc_wanted(&cfg, &store),
-            "a fresh stamp must throttle the check"
+            "fresh stamp must throttle the check even if over budget"
         );
 
         // Age the stamp past the interval → over-budget check now fires.
