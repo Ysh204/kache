@@ -581,6 +581,7 @@ fn run_compiler_directly(args: &[String]) -> Result<i32> {
             parsed.out_dir.as_deref(),
             parsed.crate_name.as_deref(),
             parsed.extra_filename.as_deref(),
+            &parsed.emit,
         );
     }
 
