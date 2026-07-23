@@ -199,9 +199,10 @@ pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
     // Miss: run the probe.
     let family = run_family_probe(program);
     let family_str = match family {
-        Some(ProbedFamily::Clang) => "clang",
-        Some(ProbedFamily::Gnu) => "gnu",
-        None => "none",
+        Ok(Some(ProbedFamily::Clang)) => "clang",
+        Ok(Some(ProbedFamily::Gnu)) => "gnu",
+        Ok(None) => "none",
+        Err(_) => return None, // Do not cache transient failures
     };
 
     // Store in the existing probe cache. Family (or "none") is encoded in
@@ -224,7 +225,10 @@ pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
         );
     }
 
-    family
+    match family {
+        Ok(Some(f)) => Some(f),
+        _ => None,
+    }
 }
 
 const FAMILY_PROBE_SOURCE: &[u8] = b"\
@@ -234,7 +238,7 @@ KACHE_PROBE_CLANG\n\
 KACHE_PROBE_GNU\n\
 #endif\n";
 
-fn run_family_probe(program: &str) -> Option<ProbedFamily> {
+fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -248,7 +252,10 @@ fn run_family_probe(program: &str) -> Option<ProbedFamily> {
         .stderr(Stdio::null());
 
     crate::platform::configure_detached_process(&mut child_cmd);
-    let mut child = child_cmd.spawn().ok()?;
+    let mut child = match child_cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return Err(()),
+    };
     let pid = child.id();
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -256,7 +263,10 @@ fn run_family_probe(program: &str) -> Option<ProbedFamily> {
         drop(stdin);
     }
 
-    let mut stdout_handle = child.stdout.take()?;
+    let mut stdout_handle = match child.stdout.take() {
+        Some(s) => s,
+        None => return Err(()),
+    };
     let (tx, rx) = std::sync::mpsc::channel();
 
     let tx_read = tx.clone();
@@ -296,12 +306,12 @@ fn run_family_probe(program: &str) -> Option<ProbedFamily> {
 
     if output.is_none() || exit_status.is_none() || exit_status.unwrap().is_none() {
         crate::platform::kill_process_group(pid);
-        return None;
+        return Err(());
     }
 
     let status = exit_status.unwrap().unwrap();
     if !status.success() {
-        return None;
+        return Ok(None);
     }
 
     let output_buf = output.unwrap();
@@ -309,9 +319,9 @@ fn run_family_probe(program: &str) -> Option<ProbedFamily> {
     let clang = stdout_str.contains("KACHE_PROBE_CLANG");
     let gnu = stdout_str.contains("KACHE_PROBE_GNU");
     match (clang, gnu) {
-        (true, false) => Some(ProbedFamily::Clang),
-        (false, true) => Some(ProbedFamily::Gnu),
-        _ => None,
+        (true, false) => Ok(Some(ProbedFamily::Clang)),
+        (false, true) => Ok(Some(ProbedFamily::Gnu)),
+        _ => Ok(None),
     }
 }
 
@@ -372,6 +382,14 @@ pub fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_family(s: &str) -> Option<ProbedFamily> {
+        match s {
+            "clang" => Some(ProbedFamily::Clang),
+            "gnu" => Some(ProbedFamily::Gnu),
+            _ => None,
+        }
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::{NamedTempFile, TempDir};
 
@@ -591,5 +609,4 @@ mod tests {
         assert_ne!(res1.unwrap(), res2);
         assert_eq!(res2, parse_family(inverted_family).unwrap());
     }
-
 }

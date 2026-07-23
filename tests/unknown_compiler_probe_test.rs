@@ -13,7 +13,7 @@ fn kache_binary() -> &'static str {
 fn probe_recovers_when_wrapper_fork_bombs() {
     let dir = tempfile::tempdir().unwrap();
     let wrapper = dir.path().join("my-compiler");
-    
+
     fs::write(
         &wrapper,
         format!("#!/bin/sh\nexec {} \"$0\" \"$@\"\n", kache_binary()),
@@ -30,18 +30,21 @@ fn probe_recovers_when_wrapper_fork_bombs() {
         .output()
         .expect("failed to run kache");
 
-    assert!(start.elapsed().as_secs() < 10, "probe should not hang on fork bomb");
+    assert!(
+        start.elapsed().as_secs() < 10,
+        "probe should not hang on fork bomb"
+    );
 }
 
 #[test]
 fn probe_recovers_when_wrapper_emits_8kb_then_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let wrapper = dir.path().join("my-compiler-hang");
-    
+
     fs::write(
         &wrapper,
         "#!/bin/sh\n\
-        printf 'A%.0s' {1..9000}\n\
+        head -c 9000 /dev/zero\n\
         sleep 60\n",
     )
     .unwrap();
@@ -56,19 +59,27 @@ fn probe_recovers_when_wrapper_emits_8kb_then_hangs() {
         .output()
         .expect("failed to run kache");
 
-    assert!(start.elapsed().as_secs() < 15, "probe must kill hanging wrapper after reading 8KB");
+    assert!(
+        start.elapsed().as_secs() < 15,
+        "probe must kill hanging wrapper after reading 8KB"
+    );
 }
 
 #[test]
 fn probe_recovers_when_wrapper_leaves_descendant_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
     let wrapper = dir.path().join("my-compiler-descendant");
-    
+    let pid_file = dir.path().join("descendant.pid");
+
     fs::write(
         &wrapper,
-        "#!/bin/sh\n\
-        (sleep 60) &\n\
-        exit 0\n",
+        format!(
+            "#!/bin/sh\n\
+            sleep 60 &\n\
+            echo $! > \"{}\"\n\
+            exit 0\n",
+            pid_file.display()
+        ),
     )
     .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
@@ -82,5 +93,19 @@ fn probe_recovers_when_wrapper_leaves_descendant_on_stdout() {
         .output()
         .expect("failed to run kache");
 
-    assert!(start.elapsed().as_secs() < 15, "probe must kill descendants holding stdout");
+    assert!(
+        start.elapsed().as_secs() < 15,
+        "probe must kill descendants holding stdout"
+    );
+
+    if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            let still_alive = unsafe { libc::kill(pid, 0) == 0 };
+            assert!(
+                !still_alive,
+                "descendant process {} should have been killed",
+                pid
+            );
+        }
+    }
 }
